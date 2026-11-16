@@ -23,10 +23,76 @@ from runtime.platform_win32 import Win32JobObject
 
 logger = logging.getLogger("presence.mcp.client")
 
-# Safe environment variables allowlist for Windows child processes
-SAFE_ENV_ALLOWLIST = {
+# ==============================================================================
+# Portions of the configuration override security policy are adapted from Goose:
+# https://github.com/aaif-goose/goose
+# Copyright (c) 2024-2025 Block, Inc. / AAIF
+# Licensed under the Apache License, Version 2.0
+# ==============================================================================
+
+# Policy A: Disallowed environment variable overrides (Configuration Override Restrictions)
+# Rejects dangerous configuration overrides associated with DLL injection, binary path manipulation,
+# language runtime hijacking, and profile redirection.
+DISALLOWED_OVERRIDE_KEYS = frozenset({
+    # Binary and executable path manipulation
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "WINDIR",
+    # DLL & dynamic library injection
+    "APPINIT_DLLS",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_BIND_NOW",
+    "LD_ASSUME_KERNEL",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    # Language runtime code injection
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+    "GEM_PATH",
+    "GEM_HOME",
+    "CLASSPATH",
+    "GO111MODULE",
+    "GOROOT",
+    "PERL5LIB",
+    # Profile & temporary directory redirection
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TEMP",
+    "TMP",
+    "SESSIONNAME",
+})
+
+# Forbidden keywords in environment variables (never pass API keys or secrets to child processes)
+FORBIDDEN_ENV_KEYWORDS = (
+    "KEY",
+    "SECRET",
+    "TOKEN",
+    "CREDENTIAL",
+    "PASSWORD",
+    "AUTH",
+    "GEMINI",
+    "GOOGLE",
+    "ANTHROPIC",
+    "OPENAI",
+)
+
+# Policy B: Safe environment variables allowlist for Windows child processes
+# Only essential operating system environment variables are inherited from the parent.
+SAFE_ENV_ALLOWLIST = frozenset({
     "SYSTEMROOT",
     "SYSTEMDRIVE",
+    "WINDIR",
     "PATH",
     "PATHEXT",
     "TEMP",
@@ -40,42 +106,103 @@ SAFE_ENV_ALLOWLIST = {
     "NUMBER_OF_PROCESSORS",
     "OS",
     "COMSPEC",
-}
-
-# Forbidden keywords in environment variables (never pass API keys or secrets to child processes)
-FORBIDDEN_ENV_KEYWORDS = (
-    "KEY",
-    "SECRET",
-    "TOKEN",
-    "CREDENTIAL",
-    "PASSWORD",
-    "AUTH",
-    "GEMINI",
-)
+    "USERNAME",
+})
 
 
-def build_isolated_environment(custom_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    """Constructs a clean, safe environment dictionary stripped of all API keys and secrets."""
+def validate_server_environment_overrides(
+    custom_env: Optional[Dict[str, str]],
+    strict: bool = False
+) -> Dict[str, str]:
+    """Policy A: Validates and filters configuration environment overrides.
+    Rejects dangerous overrides and unapproved environment variable names.
+    If strict=True, raises ValueError on the first disallowed or secret override.
+    """
+    if not custom_env:
+        return {}
+
+    validated: Dict[str, str] = {}
+    for key, val in custom_env.items():
+        key_upper = key.strip().upper()
+
+        # Check for disallowed configuration override keys
+        if key_upper in DISALLOWED_OVERRIDE_KEYS:
+            msg = f"Disallowed environment variable override '{key}' (security restriction)."
+            logger.warning(msg)
+            if strict:
+                raise ValueError(msg)
+            continue
+
+        # Check for secret / credential keyword contamination
+        if any(kw in key_upper for kw in FORBIDDEN_ENV_KEYWORDS):
+            msg = f"Blocked secret environment variable override '{key}' from MCP server configuration."
+            logger.warning(msg)
+            if strict:
+                raise ValueError(msg)
+            continue
+
+        validated[key] = str(val)
+
+    return validated
+
+
+def sanitize_search_path(raw_path: Optional[str] = None) -> str:
+    """Constructs a clean, safe PATH without relative directories or empty segments."""
+    source_path = raw_path if raw_path is not None else os.environ.get("PATH", "")
+    safe_segments = []
+    for segment in source_path.split(os.pathsep):
+        s = segment.strip().strip('"')
+        if not s or s == "." or s == "..":
+            continue
+        # Only retain valid directory paths
+        if os.path.isabs(s):
+            safe_segments.append(s)
+    return os.pathsep.join(safe_segments)
+
+
+def build_isolated_environment(
+    custom_env: Optional[Dict[str, str]] = None,
+    server_id: Optional[str] = None
+) -> Dict[str, str]:
+    """Policy B: Constructs an explicit, clean child environment dictionary.
+    Strictly excludes Gemini/provider secrets, parent environment noise, and dangerous overrides.
+    Preserves essential Windows runtime variables and merges validated overrides.
+    """
     isolated: Dict[str, str] = {}
 
-    # 1. Inherit only safe system variables
+    # 1. Inherit only essential safe Windows operating system variables
     for key, val in os.environ.items():
         key_upper = key.upper()
         if key_upper in SAFE_ENV_ALLOWLIST:
-            # Check for accidental secret injection
+            # Check for accidental secret injection in parent environment
             if not any(kw in key_upper for kw in FORBIDDEN_ENV_KEYWORDS):
-                isolated[key] = val
+                if key_upper == "PATH":
+                    isolated[key] = sanitize_search_path(val)
+                else:
+                    isolated[key] = val
 
-    # 2. Merge caller custom environment variables if they do not contain forbidden keywords
-    if custom_env:
-        for k, v in custom_env.items():
-            k_upper = k.upper()
-            if any(kw in k_upper for kw in FORBIDDEN_ENV_KEYWORDS):
-                logger.warning(f"Blocked secret environment variable '{k}' from being passed to MCP child process.")
-                continue
-            isolated[k] = str(v)
+    # 2. Guarantee critical Windows variables exist even if missing from parent os.environ
+    if "SYSTEMROOT" not in {k.upper() for k in isolated} and sys.platform == "win32":
+        isolated["SystemRoot"] = os.environ.get("SystemRoot", r"C:\Windows")
+    if "PATHEXT" not in {k.upper() for k in isolated} and sys.platform == "win32":
+        isolated["PATHEXT"] = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC")
 
-    return isolated
+    # 3. Validate and merge caller custom environment overrides (Policy A)
+    validated_overrides = validate_server_environment_overrides(custom_env, strict=False)
+    for k, v in validated_overrides.items():
+        isolated[k] = v
+
+    # 4. Final verification assertion: absolutely no secret keywords allowed in child environment
+    scrubbed: Dict[str, str] = {}
+    for k, v in isolated.items():
+        k_upper = k.upper()
+        if any(kw in k_upper for kw in FORBIDDEN_ENV_KEYWORDS):
+            logger.error(f"Critical security violation: key '{k}' contained forbidden keyword during child env build.")
+            continue
+        scrubbed[k] = v
+
+    return scrubbed
+
 
 
 class MCPClientSession:

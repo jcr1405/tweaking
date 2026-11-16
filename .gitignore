@@ -1,0 +1,32 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Environment Variables & Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Local Presence App Data (if running local development)
+data/
+logs/
+conversations/
+artifacts/
+messages/
+mcp/schemas/
+
+# Cloned recon repositories
+recon/open-interpreter/
+recon/screenpipe/
+recon/self-operating-computer/
+recon/ufo/
+

@@ -59,6 +59,10 @@ The audit examined five existing architecture documents and three primary implem
 | **P1-06** | Medium | Privacy | Included ambient clipboard reading; promised guaranteed cryptographic memory zeroization. |
 | **P1-07** | Medium | Interface | Used non-existent authority enum names (`L0_OBSERVATION`) and mismatched `ToolDefinition` fields. |
 | **P1-08** | Medium | Security | Conflated Win32 Job Object process containment with a complete security sandbox. |
+| **P2C-17** | High | Win32 API | `SEE_MASK_FLAG_NO_UI` (0x0400) was confused with `0x00000040` (`SEE_MASK_NOCLOSEPROCESS`); lack of `CloseHandle` ownership; false Class B hard-timeout claim for `ShellExecuteExW`. |
+| **P2C-18** | Medium | Data Model | `process_creation_time_ns` lacked canonical tick definition and unit formulas; sub-microsecond truncation in Python `datetime` was undocumented. |
+| **P2C-19** | High | Security/IPC | VS Code named pipe lacked concrete 4-layer authentication specification (Logon SID DACL, peer PID validation, HMAC challenge-response, 64 KB framing, allowlist). |
+| **P2C-20** | Medium | Resource Model | `SetWinEventHook` made absolute claims of "0.0% CPU" and "zero wakeups"; lacked callback reentrancy guards, bounded queue, and standardized measurement experiments (A-F). |
 
 ---
 
@@ -244,6 +248,60 @@ The audit examined five existing architecture documents and three primary implem
 
 ---
 
+### 5.17 Finding P2C-17: ShellExecuteExW Flags, Handle Ownership & Class C Execution Policy
+- **Original Flaw**: Previous specification drafts confused `SEE_MASK_FLAG_NO_UI` (0x0400) with `SEE_MASK_NOCLOSEPROCESS` (0x00000040), omitted caller handle ownership rules, and misclassified `shell.open_path` as Class B (hard timeout).
+- **Official Documentation**: [Microsoft Learn — SHELLEXECUTEINFOW Structure](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow)
+- **Corrective Decision**:
+  1. Corrected flag constants:
+     - `SEE_MASK_NOCLOSEPROCESS = 0x00000040` (requests `hProcess` if a new process was created)
+     - `SEE_MASK_FLAG_NO_UI = 0x00000400` (suppresses non-critical shell error message dialogs; security prompts like Mark-of-the-Web remain exempt by OS design)
+     - `SEE_MASK_NOZONECHECKS = 0x00000008` (PROHIBITED; must NEVER be used)
+     - `SEE_MASK_NOASYNC = 0x00000100` (forces synchronous completion on caller thread; does NOT provide timeout)
+     - `SEE_MASK_ASYNCOK = 0x00100000` (allows asynchronous execution on shell background thread)
+  2. Documented handle ownership: `SEE_MASK_NOCLOSEPROCESS` requests a process handle in `hProcess`. If the shell reuses an existing process, uses DDE, or invokes an in-process COM handler, `hProcess` is NULL. If non-NULL, Presence owns the handle and calls `CloseHandle()` immediately to prevent handle leaks.
+  3. Reclassified `shell.open_path` to **Class C (Best-Effort Asynchronous Shell Request)**. Acknowledged that AnyIO cancellation cancels the Python coroutine, but the underlying worker thread cannot be forcibly aborted without terminating the process if blocked inside the Windows shell.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.18 Finding P2C-18: Canonical 64-bit FILETIME Representation & Precision Safeguards
+- **Original Flaw**: Process creation time was represented as `process_creation_time_ns` and converted to Python `datetime.datetime`, introducing unit ambiguity and truncating sub-microsecond precision.
+- **Official Documentation**: [Microsoft Learn — FILETIME structure](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
+- **Corrective Decision**:
+  1. Replaced `process_creation_time_ns` with canonical `process_creation_filetime_ticks: int` (64-bit unsigned integer count of 100ns intervals since 1601-01-01 UTC).
+  2. Standardized exact conversion formulas using `FILETIME_UNIX_EPOCH_OFFSET_TICKS = 116444736000000000`.
+  3. Window identity and TOCTOU comparisons compare raw 64-bit integer ticks directly with exact equality (`current_ticks == expected_ticks`), eliminating all floating-point and microsecond rounding errors.
+  4. Explicitly documented that conversion to Python `datetime.datetime` truncates sub-microsecond ticks and is used strictly for display/telemetry.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.19 Finding P2C-19: 4-Layer Authenticated Windows Named Pipe IPC for VS Code
+- **Original Flaw**: VS Code named pipe IPC lacked concrete authentication, access control descriptors, and payload bounding, leaving the endpoint open to pipe squatting and cross-session manipulation.
+- **Official Documentation**: [Microsoft Learn — Named Pipe Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
+- **Corrective Decision**: Defined an end-to-end 4-layer security architecture:
+  - **Layer 1 (Transport Access Control)**: Pipe name `\\.\pipe\presence-vscode-<user>-<session>`. Created with `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) and `FILE_FLAG_FIRST_PIPE_INSTANCE` (0x00080000). Explicit DACL granting access solely to caller's Logon SID and User SID (`(A;;GRGW;;;<LogonSID>)(A;;GRGW;;;<UserSID>)`).
+  - **Layer 2 (Peer Process Identity Verification)**: Server queries client PID via `GetNamedPipeClientProcessId()`, validates binary path against `Code.exe` via `QueryFullProcessImageNameW()`, checks process creation ticks, and verifies client token Logon SID matches server Logon SID.
+  - **Layer 3 (Application Pairing & Mutual Challenge-Response)**: One-time user-initiated pairing secret stored in VS Code `SecretStorage` (DPAPI). Mutual HMAC-SHA256 challenge-response exchange with 32-byte nonces; constant-time digest verification (`secrets.compare_digest`). Ephemeral session key negotiated.
+  - **Layer 4 (Framing, Payload Bounds & Operation Authorization)**: 4-byte big-endian length prefix; 64 KB hard max payload ceiling. Strict JSON-RPC schema allowlist restricted to read-only metadata (`get_active_workspace`, `get_open_documents`, `get_active_language_id`).
+  - Threat boundary: Honestly documented same-user unprivileged malware limitations.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.20 Finding P2C-20: SetWinEventHook Lifecycle, Reentrancy Protection & Empirical Budgets
+- **Original Flaw**: Made absolute claims of "0.0% CPU" and "zero wakeups" without modeling the message pump, callback reentrancy, or teardown queue draining.
+- **Official Documentation**: [Microsoft Learn — SetWinEventHook function](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook)
+- **Corrective Decision**:
+  1. Specified dedicated `WinEventHookThread` message loop (`GetMessageW` / `DispatchMessageW`).
+  2. Implemented callback reentrancy guard (`_in_callback` flag) and bounded queuing (`collections.deque(maxlen=50)`). Non-blocking callback delegates heavy inspection to worker threads.
+  3. Defined clean teardown lifecycle: `UnhookWinEvent` -> `PostThreadMessageW(WM_QUIT)` -> `thread.join(timeout=1.0)`.
+  4. Replaced absolute claims with realistic event-driven model (kernel wait in `GetMessageW`).
+  5. Established six standardized verification experiments (A through F) with explicit Design Targets vs Acceptance Ceilings.
+- **Classification**: **CORRECTED**.
+
+---
+
 ## 6. Cross-Specification Consistency Matrix
 
 All five architecture specifications were audited together to ensure total cross-document alignment:
@@ -261,10 +319,13 @@ All five architecture specifications were audited together to ensure total cross
 | **Permission Levels** | `AuthorityLevel.L0_OBSERVE` | Boundary enforcement | Exact enum names (`L0/L2/L3`)| Verified in 2C.3/2C.4 | ADR-2C-04 | **CONSISTENT** |
 | **Clipboard Handling** | Deferred from default context | Prohibited from ambient loop | Deferred from tools | Deferred from Phase 2C| ADR-2C-08 | **CONSISTENT** |
 | **Win32 API Semantics** | User32 cached caption (no timeout)| No hooks into child controls | Best-effort focus; no AttachThreadInput | Tested in 2C.1/2C.4 | ADR-2C-01 / 05 | **CONSISTENT** |
-| **Timeout & Cancellation** | Thread pump unhooking | Class A/B operation limits | Class A/B native execution | Tested in 2C.4 | ADR-2C-05 | **CONSISTENT** |
-| **Process Containment** | Process creation time check | Job Object lifecycle controls | ShellExecuteEx separated from Jobs | Launcher in 2C.4 | ADR-2C-07 / 09 | **CONSISTENT** |
-| **Resource Budgets** | Measurable design targets | Leakage prevention targets | Execution latency targets | Measurement in 2C.1 | ADR-2C-01 / 02 | **CONSISTENT** |
-| **Application Providers** | Provider interface in 2C.5 | Named pipe isolation | N/A | Evaluated in 2C.5 | ADR-2C-07 | **CONSISTENT** |
+| **Timeout & Cancellation** | Thread pump unhooking | Class A/B/C operation limits | Class A/C native execution | Tested in 2C.4 | ADR-2C-05 / 10 | **CONSISTENT** |
+| **Process Containment** | Process creation ticks check | Job Object lifecycle controls | ShellExecuteEx separated from Jobs | Launcher in 2C.4 | ADR-2C-07 / 09 | **CONSISTENT** |
+| **Resource Budgets** | Measurable design targets | Leakage prevention targets | Execution latency targets | Measurement in 2C.1 (Exp A-F) | ADR-2C-01 / 13 | **CONSISTENT** |
+| **Application Providers** | Authenticated named pipe in 2C.5| 4-layer IPC security architecture | N/A | Evaluated in 2C.5 | ADR-2C-12 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flag constants; CloseHandle; Class C | Subphase 2C.4 | ADR-2C-10 | **CONSISTENT** |
+| **FILETIME Representation** | Canonical 64-bit ticks | WindowIdentity ticks | TOCTOU raw integer equality | Subphase 2C.0 / 2C.1 | ADR-2C-11 | **CONSISTENT** |
+| **WinEventHook Model** | Message pump; deque; reentrancy guard | Threat T-01 mitigation | N/A | Subphase 2C.1 (Exp A-F) | ADR-2C-13 | **CONSISTENT** |
 
 ---
 
@@ -286,10 +347,11 @@ The implementation roadmap is frozen into six sequential subphases:
   Phase 2C.1: Native Foreground-Window Awareness
       │       - WinEventHookThread dedicated message pump (GetMessageW / DispatchMessageW)
       │       - SetWinEventHook(EVENT_SYSTEM_FOREGROUND) out-of-context hook
+      │       - Reentrancy guard (_in_callback) and non-blocking bounded deque (maxlen=50)
       │       - GetForegroundWindow, GetWindowTextW (cached caption), GetClassNameW
-      │       - Composite WindowIdentity (GetProcessTimes process creation timestamp)
+      │       - Composite WindowIdentity (GetProcessTimes canonical FILETIME ticks: int)
       │       - 150 ms event debouncing and duplicate suppression
-      │       - Clean unhooking and thread termination verification
+      │       - Clean unhooking and thread termination verification (UnhookWinEvent, WM_QUIT)
       ▼
   Phase 2C.2: Context Snapshot & AgentExecutor Integration
       │       - ContextSnapshotBuilder with item-level sensitivity filtering
@@ -308,13 +370,16 @@ The implementation roadmap is frozen into six sequential subphases:
   Phase 2C.4: First Reversible Windows Execution Capabilities
       │       - desktop.activate_window (Class A best-effort with WindowIdentity TOCTOU check;
       │         FlashWindowEx taskbar alert on OS lock; NO AttachThreadInput)
-      │       - shell.open_path (Class B ShellExecuteExW; NO SEE_MASK_NOZONECHECKS;
-      │         executable blacklist; disassociated from Job Object containment)
+      │       - shell.open_path (Class C best-effort async ShellExecuteExW;
+      │         fMask = SEE_MASK_FLAG_NO_UI (0x0400) | SEE_MASK_ASYNCOK (0x00100000) | SEE_MASK_NOCLOSEPROCESS (0x00000040);
+      │         CloseHandle on hProcess; NO SEE_MASK_NOZONECHECKS; executable blacklist;
+      │         disassociated from Job Object containment)
       │       - AuthorityLevel.L2_EXECUTE_REVERSIBLE policy enforcement
       │       - [CLIPBOARD READING DEFERRED]
       ▼
   Phase 2C.5: Application-Specific Context Provider Foundation
-              - VS Code Integration: Option C authenticated named pipe contract
+              - VS Code Integration: 4-layer authenticated named pipe architecture
+                (Logon SID DACL, PID verification, HMAC-SHA256 challenge-response, 64 KB framing)
               - Windows Terminal: Option C opt-in shell integration hook contract
               - Provider isolation: Class B 500 ms timeouts; graceful fallback to window metadata
 ```
@@ -327,24 +392,25 @@ Every gate from Section 27 was rigorously evaluated against the corrected specif
 
 | Gate | Architecture Dimension | Requirement & Acceptance Condition | Evaluation | Status |
 |---|---|---|---|:---:|
-| **Gate A** | Win32 Correctness | All proposed Windows API behaviors match official documentation. | `GetWindowTextW` top-level cache, `SetForegroundWindow` lock, `SetWinEventHook` message pump, `GetProcessTimes` verified against MSDN. | **PASS** |
+| **Gate A** | Win32 Correctness | All proposed Windows API behaviors match official documentation. | `GetWindowTextW` top-level cache, `SetForegroundWindow` lock, `SetWinEventHook` message pump, `SHELLEXECUTEINFOW` flags (`SEE_MASK_FLAG_NO_UI = 0x0400`), canonical FILETIME ticks, and Logon SID DACL verified against MSDN. | **PASS** |
 | **Gate B** | Context Lifecycle | TTL, window switching, conversation isolation, and persistence rules agree. | Unified retention model: transient active snapshot only; no ring buffer; invalidation on switch; trajectory persistence only on explicit turn reference. | **PASS** |
 | **Gate C** | Data Sensitivity | Sensitivity is assigned and enforced at individual data-item level. | `ContextItem` defines item-level sensitivity (`PUBLIC`, `PERSONAL`, `SENSITIVE`, `PROTECTED`). | **PASS** |
 | **Gate D** | Data Egress | Model-provider and MCP transmission rules are explicit. | Egress rules defined for Gemini cloud API; ambient context strictly stripped from MCP tool parameters. | **PASS** |
 | **Gate E** | Prompt Injection | Environmental text is untrusted data; XML delimiters are not treated as sufficient defense. | Structural untrusted data classification; constitutional guardrails; model cannot grant consent; L3 HMAC tokens required. | **PASS** |
-| **Gate F** | Shell Safety | No default `SEE_MASK_NOZONECHECKS`; process containment claims are accurate. | `SEE_MASK_NOZONECHECKS` removed; `ShellExecuteEx` separated from Job Object containment; executable blacklist enforced. | **PASS** |
-| **Gate G** | Window Activation | Windows foreground restrictions are respected. | Best-effort activation; `AttachThreadInput` rejected; taskbar flash fallback; composite `WindowIdentity` TOCTOU guard. | **PASS** |
+| **Gate F** | Shell Safety | No default `SEE_MASK_NOZONECHECKS`; process containment claims are accurate. | `SEE_MASK_NOZONECHECKS` prohibited; `SEE_MASK_FLAG_NO_UI` (0x0400) corrected; caller closes `hProcess`; Class C async classification; Job Object separated. | **PASS** |
+| **Gate G** | Window Activation | Windows foreground restrictions are respected. | Best-effort activation; `AttachThreadInput` rejected; taskbar flash fallback; composite `WindowIdentity` TOCTOU guard with raw 64-bit FILETIME ticks. | **PASS** |
 | **Gate H** | Timeout Correctness | No false promise that Python thread cancellation terminates native work. | AnyIO worker thread limitations documented; Class A/B/C/D native operation taxonomy established. | **PASS** |
-| **Gate I** | Provider Integration | VS Code and Windows Terminal integration mechanisms are technically valid. | VS Code named pipe contract (Option C) and Terminal shell hook contract (Option C) established; Terminal external API absence acknowledged. | **PASS** |
-| **Gate J** | Data Contracts | Immutability, timestamps, provenance, and size limits are properly defined. | Deep immutability enforced; split timestamps (`observed_utc` vs `observed_monotonic`); caption clamped to 200 chars. | **PASS** |
+| **Gate I** | Provider Integration | VS Code and Windows Terminal integration mechanisms are technically valid. | VS Code 4-layer authenticated named pipe contract (Logon SID DACL, PID verification, HMAC challenge-response, 64 KB framing) and Terminal shell hook contract established. | **PASS** |
+| **Gate J** | Data Contracts | Immutability, timestamps, provenance, and size limits are properly defined. | Deep immutability enforced; split timestamps (`observed_utc` vs `observed_monotonic`); canonical `process_creation_filetime_ticks: int`; caption clamped to 200 chars. | **PASS** |
 | **Gate K** | Permission Integration | Exact existing enums and ToolDefinition interface are used. | Verified against `runtime/permissions.py` (`AuthorityLevel.L0_OBSERVE`, etc.) and `runtime/tools/registry.py` (`ToolDefinition`). | **PASS** |
 | **Gate L** | Privacy Model | No indiscriminate content monitoring or automatic clipboard access. | Continuous OCR/audio/keystrokes prohibited; clipboard reading explicitly deferred. | **PASS** |
-| **Gate M** | Resource Targets | Budgets are measurable targets, not invented benchmarks. | Targets labeled as design budgets; empirical measurement methodology defined for Phase 2C.1. | **PASS** |
-| **Gate N** | Cross-Spec Consistency | Specifications 41–45 agree across all dimensions. | Consistency matrix verified with zero contradictions across all five revised specifications. | **PASS** |
+| **Gate M** | Resource Targets | Budgets are measurable targets, not invented benchmarks. | Targets separated into Design Targets vs Acceptance Ceilings; standardized Experiments A through F defined for empirical validation. | **PASS** |
+| **Gate N** | Cross-Spec Consistency | Specifications 41–45 agree across all dimensions. | Consistency matrix verified with zero contradictions across all revised specifications. | **PASS** |
 | **Gate O** | Implementation Scope | No Phase 2C source code has been created or modified. | Verified: 100% documentation milestone; zero production Python code modified. | **PASS** |
 | **Gate P** | Documentation Complete | Specification 46 is complete and references authoritative evidence. | Specification 46 authored with full citations, ADR references, and discrepancy registers. | **PASS** |
+| **Gate Q** | API, IPC & Resource Accuracy | ShellExecute flags, FILETIME ticks, named pipe auth, and hook lifecycle model are validated. | All findings P2C-17 through P2C-20 resolved and cross-referenced in Specification 47. | **PASS** |
 
-**All 16 Architectural Acceptance Gates (Gates A through P) are PASS.**
+**All 17 Architectural Acceptance Gates (Gates A through Q) are PASS.**
 
 ---
 
@@ -357,8 +423,8 @@ Every gate from Section 27 was rigorously evaluated against the corrected specif
    - URL: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow
    - Verifies: Foreground lock restrictions; conditions under which a process is permitted to set foreground.
 3. **Microsoft Learn — SHELLEXECUTEINFOW Structure**:
-   - URL: https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfoa
-   - Verifies: `SEE_MASK_NOZONECHECKS` bypasses `IAttachmentExecute` zone checks; shell execution does not guarantee a new process handle or Job assignment.
+   - URL: https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow
+   - Verifies: `SEE_MASK_FLAG_NO_UI = 0x00000400`, `SEE_MASK_NOCLOSEPROCESS = 0x00000040`, `SEE_MASK_ASYNCOK = 0x00100000`; `SEE_MASK_NOZONECHECKS` bypasses `IAttachmentExecute` zone checks; shell execution does not guarantee a new process handle or Job assignment.
 4. **Microsoft Learn — SetWinEventHook Function**:
    - URL: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook
    - Verifies: `WINEVENT_OUTOFCONTEXT` requirements; Win32 message pump requirement (`GetMessageW` / `DispatchMessageW`).
@@ -368,15 +434,24 @@ Every gate from Section 27 was rigorously evaluated against the corrected specif
 6. **Microsoft Learn — GetProcessTimes Function**:
    - URL: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes
    - Verifies: Process creation timestamp retrieval for composite `WindowIdentity` TOCTOU protection.
-7. **AnyIO Documentation — Running Code in Worker Threads**:
-   - URL: https://anyio.readthedocs.io/en/stable/threads.html
-   - Verifies: Cancelling an AnyIO coroutine abandons the awaiting task, but the underlying worker thread continues executing until the synchronous function returns.
-8. **Visual Studio Code Extension API**:
-   - URL: https://code.visualstudio.com/api/references/vscode-api
-   - Verifies: Workspace folder and editor inspection APIs; justifies Option C authenticated named pipe contract.
-9. **Microsoft Learn — Windows Terminal Shell Integration**:
-   - URL: https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration
-   - Verifies: `OSC 9;9` informs Terminal of cwd, but Terminal does not expose a public external query API to third-party applications.
+7. **Microsoft Learn — FILETIME Structure**:
+   - URL: https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+   - Verifies: 64-bit count of 100-nanosecond intervals since January 1, 1601 UTC.
+8. **Microsoft Learn — Named Pipe Security and Access Rights**:
+   - URL: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
+   - Verifies: DACL control, Logon SID restriction, and `PIPE_REJECT_REMOTE_CLIENTS`.
+9. **Microsoft Learn — GetNamedPipeClientProcessId Function**:
+   - URL: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid
+   - Verifies: Server query of connected client PID for process image verification.
+10. **AnyIO Documentation — Running Code in Worker Threads**:
+    - URL: https://anyio.readthedocs.io/en/stable/threads.html
+    - Verifies: Cancelling an AnyIO coroutine abandons the awaiting task, but the underlying worker thread continues executing until the synchronous function returns.
+11. **Visual Studio Code Extension API**:
+    - URL: https://code.visualstudio.com/api/references/vscode-api
+    - Verifies: Workspace folder and editor inspection APIs; justifies Option C authenticated named pipe contract.
+12. **Microsoft Learn — Windows Terminal Shell Integration**:
+    - URL: https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration
+    - Verifies: `OSC 9;9` informs Terminal of cwd, but Terminal does not expose a public external query API to third-party applications.
 
 ---
 

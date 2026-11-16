@@ -12,7 +12,7 @@ Prior to Phase 2C, Presence established:
 - **Phase 2A**: Gemini model integration, provider abstraction, and `AgentExecutor` turn loop.
 - **Phase 2B & 2B.1**: Subprocess process containment via native Win32 Job Objects, suspended process launch, handle isolation, stdio pipe transport with bounded memory, and multi-tier permission enforcement.
 
-This corrected specification establishes the architecture of the `runtime/context/` subsystem, its lifecycle, native Win32 API contracts, event-driven pipeline, item-level sensitivity, and integration with `AgentExecutor`.
+This specification establishes the corrected architecture of the `runtime/context/` subsystem, its lifecycle, native Win32 API contracts, event-driven pipeline, exact FILETIME tick identity, named pipe endpoint security, reentrancy-safe hook architecture, and integration with `AgentExecutor`.
 
 ---
 
@@ -36,7 +36,7 @@ Phase 2C is strictly additive to the existing backend and preserves all core inv
 |  | (ForegroundHookWorker) |      | (Immutable, Transient |      | (runtime/tools/registry.py)  |  |
 |  +-----------+------------+      |   Single Point-in-    |      +--------------+---------------+  |
 |              |                   |      Time Value)      |                     |                  |
-|              | Win32 hooks       +-----------------------+                     v                  |
+|              | WinEvent hooks    +-----------------------+                     v                  |
 |              v                                                  +------------------------------+  |
 |  +------------------------+                                     |     PermissionBoundary       |  |
 |  |  Native Windows OS     |                                     |   (runtime/permissions.py)   |  |
@@ -68,7 +68,7 @@ Phase 2C is strictly additive to the existing backend and preserves all core inv
 
 ## 3. Windows Context Dimensions & Authoritative Lifecycle
 
-Presence establishes a strict 11-dimension taxonomy of desktop context. No context is collected without explicit classification:
+Presence establishes a strict 11-dimension taxonomy of desktop context:
 
 | ID | Context Dimension | Acquisition Mechanism | Native Win32 API | Sensitivity Class | Acquisition Mode | Expiration Trigger | Default Persistence | Model Egress | MCP Egress |
 |---|---|---|---|---|---|---|---|---|---|
@@ -78,14 +78,11 @@ Presence establishes a strict 11-dimension taxonomy of desktop context. No conte
 | **D04** | Process ID (PID) | Thread/process query | `GetWindowThreadProcessId` | `PUBLIC_CONTEXT` | Event-driven | Process exit | None (transient) | Yes (metadata) | No |
 | **D05** | Executable Path | Query process image | `QueryFullProcessImageNameW` | `PUBLIC_CONTEXT` | Event-driven | Process exit | None (transient) | Yes (metadata) | No |
 | **D06** | Window Class Name | Window query | `GetClassNameW` | `PUBLIC_CONTEXT` | Event-driven | Window change | None (transient) | Yes (metadata) | No |
-| **D07** | Process Start Time | Process times query | `GetProcessTimes` | `PUBLIC_CONTEXT` | Event-driven | Process exit | None (transient) | Internal (TOCTOU guard) | No |
-| **D08** | Workspace / Folder | Application Provider | Local IPC / Extension | `PERSONAL_CONTEXT` | Request-driven | Session change | Trajectory step only | Yes (if enabled) | No |
+| **D07** | Process Creation Ticks | Process times query | `GetProcessTimes` | `PUBLIC_CONTEXT` | Event-driven | Process exit | None (transient) | Internal (TOCTOU guard) | No |
+| **D08** | Workspace / Folder | Application Provider | Local Authenticated Pipe | `PERSONAL_CONTEXT` | Request-driven | Session change | Trajectory step only | Yes (if enabled) | No |
 | **D09** | User-Selected Text | Explicit User Tool | Targeted UI Automation | `SENSITIVE_CONTEXT` | User-initiated | Single turn | Trajectory step only | Explicit turn only | No |
 | **D10** | System Resources | Win32 telemetry | `GlobalMemoryStatusEx` | `PUBLIC_CONTEXT` | Request-driven | 5s monotonic TTL | None (transient) | Yes | No |
-| **D11** | User File Attach | Presence CLI / UI | Explicit file path | `PERSONAL_CONTEXT` | User-initiated | Conversation | SQLite / ArtifactStore | Explicit turn only | Approved tools |
-
-> [!IMPORTANT]
-> **Clipboard Access Deferred**: Indiscriminate or ambient clipboard monitoring is strictly prohibited. Reading clipboard content is deferred from default Phase 2C capabilities. If implemented in a future milestone, it requires explicit user initiation and single-use L3 consent.
+| **D11** | User File Attachment | Presence CLI / UI | Explicit file path | `PERSONAL_CONTEXT` | User-initiated | Conversation | SQLite / ArtifactStore | Explicit turn only | Approved tools |
 
 ---
 
@@ -98,12 +95,11 @@ All native Win32 APIs used for context acquisition are documented with official 
 #### `GetForegroundWindow`
 - **Documentation**: [Microsoft Learn — GetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow)
 - **Signature**: `HWND GetForegroundWindow(VOID)`
-- **Behavior**: Retrieves a handle to the foreground window (the window with which the user is currently working).
-- **Thread Affinity**: None. Callable from any thread.
-- **Failure / Edge Cases**: Returns `NULL` if the foreground window is changing, the desktop is locked, a fullscreen UAC prompt is displayed, or a screen saver is running.
+- **Behavior**: Retrieves a handle to the foreground window. Non-blocking.
+- **Failure / Edge Cases**: Returns `NULL` if foreground window is changing, desktop is locked, UAC prompt is displayed, or screen saver is active.
 - **Presence Policy**: Returns `None`; suppresses event publication if `HWND == NULL`.
 
-#### `GetWindowTextW` (Technical Correction — P0-01)
+#### `GetWindowTextW` (Technical Clarification — P0-01)
 - **Documentation**: [Microsoft Learn — GetWindowTextW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw)
 - **Signature**: `int GetWindowTextW(HWND hWnd, LPWSTR lpString, int nMaxCount)`
 - **Accurate Operational Semantics**:
@@ -113,54 +109,57 @@ All native Win32 APIs used for context acquisition are documented with official 
 - **Presence Implementation**:
   - Used strictly for top-level window captions.
   - Buffer allocation: Fixed buffer of 512 `WCHAR` (1024 bytes).
-  - Truncation: Hard clamped to 200 characters in the adapter layer.
+  - Truncation: Clamped to 200 characters in the adapter layer.
   - No synthetic message timeouts (`SendMessageTimeoutW`) are needed for top-level captions.
 
 #### `GetClassNameW`
 - **Documentation**: [Microsoft Learn — GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew)
 - **Signature**: `int GetClassNameW(HWND hWnd, LPWSTR lpClassName, int nMaxCount)`
-- **Behavior**: Retrieves the name of the window class from the internal class atom. Fast, non-blocking, does not send window messages.
-- **Buffer**: 256 `WCHAR`.
+- **Behavior**: Retrieves the name of the window class from the internal class atom. Fast, non-blocking, does not send window messages. Buffer: 256 `WCHAR`.
 
 #### `GetWindowThreadProcessId`
 - **Documentation**: [Microsoft Learn — GetWindowThreadProcessId](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid)
 - **Signature**: `DWORD GetWindowThreadProcessId(HWND hWnd, LPDWORD lpdwProcessId)`
-- **Behavior**: Retrieves the identifier of the thread and process that created the window. Fast, direct memory read, non-blocking.
+- **Behavior**: Retrieves thread and process ID. Fast, direct memory read, non-blocking.
 
-### 4.2 Process Identity & TOCTOU Protection
+### 4.2 Process Identity, FILETIME Representation & TOCTOU Protection (P2C-18)
 
-#### `OpenProcess` & `QueryFullProcessImageNameW`
-- **Documentation**: [Microsoft Learn — OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess), [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
-- **Access Mask**: `PROCESS_QUERY_LIMITED_INFORMATION` (`0x1000`). Never requests elevated rights.
-- **Handle Lifetime**: Wrapped in strict `try/finally` with `CloseHandle()`.
-- **Buffer**: 1024 `WCHAR`.
+#### `GetProcessTimes` & Canonical FILETIME Ticks
+- **Documentation**: [Microsoft Learn — GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes), [FILETIME Structure](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
+- **FILETIME Definition**: A 64-bit integer representing the number of **100-nanosecond intervals** (ticks) since January 1, 1601 (UTC).
+- **Canonical Representation**: To prevent precision loss and unit confusion, Presence stores and compares process creation timestamps strictly as a 64-bit integer tick count: `process_creation_filetime_ticks: int`.
 
-#### `GetProcessTimes` (Window Identity TOCTOU Guard — P1-05)
-- **Documentation**: [Microsoft Learn — GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
-- **Behavior**: Retrieves process creation, exit, kernel, and user times.
-- **Purpose in Presence**: Captures `lpCreationTime` (`FILETIME` struct converted to a 64-bit integer). This timestamp uniquely identifies the process instance, preventing HWND and PID recycling attacks.
+```python
+# Number of 100-nanosecond intervals between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC
+FILETIME_UNIX_EPOCH_OFFSET_TICKS = 116444736000000000
 
-### 4.3 Event Hook Infrastructure (`SetWinEventHook`)
+def filetime_to_ticks(high: int, low: int) -> int:
+    """Constructs canonical 64-bit integer tick count from FILETIME high/low DWORDs."""
+    return (high << 32) | low
 
-- **Documentation**: [Microsoft Learn — SetWinEventHook](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook)
-- **Parameters**:
-  - `eventMin` / `eventMax`: `EVENT_SYSTEM_FOREGROUND` (`0x0003`).
-  - `hmodWinEventProc`: `NULL`.
-  - `pfnWinEventProc`: Pointer to Python `WINEVENTPROC` callback via `ctypes`.
-  - `idProcess` / `idThread`: `0` (global desktop hook).
-  - `dwFlags`: `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS` (`0x0000 | 0x0002`).
-- **Hook Thread Architecture**:
-  - Out-of-context hooks require an active Win32 message pump (`GetMessageW` / `DispatchMessageW`).
-  - Dedicated background OS thread: `WinEventHookThread`.
-  - Handoff to asyncio: The hook callback queues a lightweight tuple `(hwnd, event_time_monotonic)` and dispatches to the asyncio event loop using `loop.call_soon_threadsafe()`.
-- **Unhooking & Clean Teardown**:
-  - Calling `UnhookWinEvent(hHook)` on the hook thread during `ContextManager.stop()`.
-  - Posting `WM_QUIT` to break the message loop.
-  - Joining the thread with a 500 ms timeout.
+def filetime_ticks_to_unix_ns(ticks: int) -> int:
+    """Converts FILETIME 100-ns ticks to Unix epoch nanoseconds."""
+    return (ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS) * 100
+
+def filetime_ticks_to_unix_seconds(ticks: int) -> float:
+    """Converts FILETIME 100-ns ticks to Unix epoch seconds (floating-point)."""
+    return (ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS) / 10_000_000.0
+
+def filetime_ticks_to_utc_datetime(ticks: int) -> datetime:
+    """Converts FILETIME ticks to UTC datetime.
+    Note: Python datetime has microsecond precision; sub-microsecond precision is truncated.
+    """
+    unix_ticks = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS
+    whole_microseconds = unix_ticks // 10
+    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=whole_microseconds)
+```
+
+> [!IMPORTANT]
+> **Identity Comparison Invariant**: Canonical process identity validation **must always compare raw integer ticks** (`live_ticks == expected_ticks`). Conversions to float seconds or `datetime` are strictly for logging and human presentation.
 
 ---
 
-## 5. Robust Window Identity Contract (P1-05)
+## 5. Robust Window Identity Contract (P1-05, P2C-18)
 
 HWND handles are assigned by the Windows window manager and are routinely recycled when windows close. Relying solely on `HWND` or `(HWND, PID)` creates a Time-of-Check to Time-of-Use (TOCTOU) vulnerability where an agent turn targets a window that was closed and whose handle was reassigned to a different application.
 
@@ -172,10 +171,10 @@ class WindowIdentity:
     """Strongly bound, composite identity of an observed Windows desktop window."""
     hwnd: int
     process_id: int
-    process_creation_time_ns: int   # 64-bit timestamp from GetProcessTimes
+    process_creation_filetime_ticks: int   # Exact raw 100-ns FILETIME count
     window_class: str
     application_name: str
-    observed_monotonic: float       # time.monotonic() tick
+    observed_monotonic: float              # time.monotonic() tick
     snapshot_id: str
 
     def matches_live_window(self) -> bool:
@@ -203,119 +202,139 @@ class WindowIdentity:
                 h_proc, ctypes.byref(c_time), ctypes.byref(e_time),
                 ctypes.byref(k_time), ctypes.byref(u_time)
             ):
-                live_ns = (c_time.dwHighDateTime << 32) | c_time.dwLowDateTime
-                return live_ns == self.process_creation_time_ns
+                live_ticks = (c_time.dwHighDateTime << 32) | c_time.dwLowDateTime
+                return live_ticks == self.process_creation_filetime_ticks
             return False
         finally:
             ctypes.windll.kernel32.CloseHandle(h_proc)
 ```
 
+### 5.1 TOCTOU Race Condition Boundaries
+While composite verification drastically minimizes handle-recycling risks, no user-mode check can achieve a mathematical zero-nanosecond atomic guarantee across separate Win32 API calls. If a window closes in the microsecond between `matches_live_window()` and `SetForegroundWindow()`, `SetForegroundWindow()` safely returns `FALSE`, and Presence handles this gracefully via the taskbar flash fallback.
+
 ---
 
-## 6. Context Manager Architecture & Deep Immutability (P1-04)
+## 6. SetWinEventHook Lifecycle, Reentrancy & Resource Model (P2C-20)
 
-### 6.1 Logical Package Structure
+### 6.1 Accurate WinEvent Architecture
+- **Documentation**: [Microsoft Learn — SetWinEventHook](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook), [Guarding Against Reentrancy in Hook Functions](https://learn.microsoft.com/en-us/windows/win32/winauto/guarding-against-reentrancy-in-hook-functions)
+- **Mechanism**: Windows delivers out-of-context accessibility events to the registered hook callback through the User32 WinEvent infrastructure.
+- **Thread & Message Queue Ownership**:
+  - The thread that calls `SetWinEventHook` **must run a Win32 message pump** (`GetMessageW` / `DispatchMessageW`).
+  - Events are queued sequentially to this thread's message queue.
+  - Dedicated background OS thread: `WinEventHookThread`.
+  - When idle, `GetMessageW` sleeps inside a kernel wait; CPU usage is minimal, but Presence does not make misleading claims of "0.0% CPU" or "zero timer wakeups".
 
-```
-runtime/context/
-├── __init__.py           # Public exports (ContextManager, ContextSnapshot, WindowIdentity)
-├── models.py             # Deeply immutable value contracts and sensitivity enums
-├── contracts.py          # Abstract interfaces (ContextSource, ContextAdapter, Provider)
-├── source.py             # Base ContextSource class and lifecycle state machine
-├── adapter.py            # Normalization, sanitization, and item-level classification
-├── manager.py            # ContextManager coordinator, debouncing, snapshot cache
-├── snapshot.py           # Snapshot builder and prompt block formatting
-├── subscriptions.py      # Topic-based filtered subscriber router
-├── expiration.py         # Expiration, TTL, and cache-eviction policies
-├── sources/
-│   ├── __init__.py
-│   └── foreground_window.py  # WinEventHookThread and User32 window observer
-└── providers/
-    └── __init__.py
-```
-
-### 6.2 Deep Immutability Contract
-
-Python's `@dataclass(frozen=True)` does not prevent mutation of nested dictionaries or lists. To guarantee complete thread safety and prevent TOCTOU mutations between context capture and agent turn execution:
-
-1. All internal payloads are recursively converted into immutable types (`tuple` for sequences, frozen key-value tuples or custom `FrozenMapping` for dictionaries).
-2. All strings are clamped to predefined maximum lengths during construction.
-3. Timestamps are split strictly:
-   - `observed_utc`: ISO-8601 string for logging, audit, and user presentation.
-   - `observed_monotonic`: Float from `time.monotonic()` for all internal TTL and expiration calculations (immune to NTP sync and system clock shifts).
+### 6.2 Minimal, Non-Blocking, Reentrancy-Safe Callback
+Out-of-context hook callbacks can be reentered if message pumping occurs during execution. To guarantee safety and prevent thread stalls:
+1. **Zero Expensive Work in Callback**: The callback does **NOT** query window text, inspect process images, allocate heavy structures, make COM calls, or perform disk I/O.
+2. **Reentrancy Guard**: An atomic reentrancy counter immediately drops nested callback invocations.
+3. **Bounded Thread-Safe Queue**: The callback places a compact tuple `(hwnd, time.monotonic())` into a thread-safe bounded queue (`collections.deque(maxlen=50)`).
+4. **Handoff to AsyncIO**: Dispatches notification to the main asyncio loop via `loop.call_soon_threadsafe(manager._on_hook_event)`.
 
 ```python
-@dataclass(frozen=True)
-class ContextItem:
-    """Individually classified contextual item."""
-    key: str
-    value: Any                  # Must be primitive (str, int, float, bool) or tuple
-    sensitivity: ContextSensitivity
-    provenance: str
-    observed_monotonic: float
-    observed_utc: str
+class WinEventCallbackState:
+    def __init__(self, loop, on_event_callback, max_queue=50):
+        self.loop = loop
+        self.on_event = on_event_callback
+        self.queue = deque(maxlen=max_queue)
+        self.reentrancy_lock = False
 
-@dataclass(frozen=True)
-class ContextSnapshot:
-    """Point-in-time immutable snapshot of ambient Windows desktop state."""
-    snapshot_id: str
-    window_identity: Optional[WindowIdentity]
-    caption: str
-    items: Tuple[ContextItem, ...]
-    captured_monotonic: float
-    captured_utc: str
-    ttl_seconds: float = 300.0
-
-    def is_expired(self) -> bool:
-        return (time.monotonic() - self.captured_monotonic) > self.ttl_seconds
+def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventThread, dwmsEventTime):
+    # Guard: only foreground events on top-level windows
+    if event != 0x0003 or not hwnd or idObject != 0:
+        return
+        
+    state = _GLOBAL_HOOK_STATE
+    if state.reentrancy_lock:
+        return  # Drop reentrant calls
+        
+    state.reentrancy_lock = True
+    try:
+        now_mono = time.monotonic()
+        state.queue.append((hwnd, now_mono))
+        state.loop.call_soon_threadsafe(state.on_event)
+    finally:
+        state.reentrancy_lock = False
 ```
+
+### 6.3 Clean Unhooking & Teardown Protocol
+During `ContextManager.stop()`:
+1. Calls `UnhookWinEvent(hHook)` on the hook thread.
+2. Posts `WM_QUIT` to the hook thread's message queue via `PostThreadMessageW()`.
+3. Joins `WinEventHookThread` with a 500 ms timeout.
+4. Clears all pending queue references, ensuring zero dangling callbacks or thread leaks across repeated cycles.
 
 ---
 
-## 7. Context Precedence & AgentExecutor Integration
+## 7. Authenticated Named Pipe Endpoint Architecture (P2C-19)
 
-Environmental context is injected into `AgentExecutor` turn prompts under a strict **precedence hierarchy**:
+For Subphase 2C.5, Presence defines an authenticated local IPC channel to receive workspace metadata from developer tools (VS Code):
 
 ```
-+-------------------------------------------------------------------------------+
-| 1. System Constitution & Security Guardrails (Immutable Top Authority)        |
-|    - Constitutional rules, tool calling schemas, security invariants          |
-+-------------------------------------------------------------------------------+
-| 2. Current User Message (Explicit User Intent)                                |
-|    - The exact instructions entered by the user for this turn                 |
-+-------------------------------------------------------------------------------+
-| 3. Explicit User-Selected Content & Attachments                               |
-|    - Text highlighted by user or files explicitly attached                    |
-+-------------------------------------------------------------------------------+
-| 4. Ambient Desktop Context (UNTRUSTED METADATA)                                |
-|    - Current foreground app and window caption, clearly isolated              |
-+-------------------------------------------------------------------------------+
-| 5. Conversation Trajectory & Short-Term Continuity                            |
-|    - Prior turn dialogue, tool inputs and execution results                   |
-+-------------------------------------------------------------------------------+
-| 6. Retrieved Historical Summaries & Long-Term Memory                          |
-|    - FTS5 recalled summaries from previous sessions                           |
-+-------------------------------------------------------------------------------+
+[Presence Runtime Server]
+    │ (CreateNamedPipeW with explicit Logon SID DACL)
+    │ (PIPE_REJECT_REMOTE_CLIENTS | FILE_FLAG_FIRST_PIPE_INSTANCE)
+    ▼
+[Named Pipe: \\.\pipe\presence-vscode-<logon-hash>-<session>]
+    ▲
+    │ (ConnectNamedPipe)
+    │ 1. OS Client Verification (PID, Token, User SID, Executable Image)
+    │ 2. Cryptographic Mutual Challenge-Response (HMAC-SHA256, Nonces)
+    │ 3. Strict Framed JSON Message Protocol (Allowlisted Operations)
+[VS Code Extension Client]
 ```
 
-### Subagent and Conversation Isolation Rules:
-1. **Subagents**: When an agent spawns a subagent via `invoke_subagent`, the subagent receives an **empty** environmental context by default. It only observes environment context if explicitly passed in its role brief.
-2. **Conversation Switching**: Switching active conversation IDs immediately clears any active cached snapshot. Ambient context is re-evaluated fresh for the new conversation turn.
-3. **Workspace Lineage**: In workspace modes `share`, `branch`, or `inherit`, trajectory steps are tracked per lineage, but ambient desktop context belongs strictly to the physical desktop session and is never persisted across branches.
+### 7.1 Transport Security & Server Hardening
+- **Pipe Naming**: `\\.\pipe\presence-vscode-<logon-sid-hash>-<session-id>`. Contains no secrets; scoped to user session.
+- **DACL Restriction**: Explicit Security Descriptor granting access strictly to:
+  * Current User SID (`(A;;GRGW;;;<UserSID>)`)
+  * Current Logon SID (`(A;;GRGW;;;<LogonSID>)`), preventing cross-session or service access.
+- **Flags**:
+  * `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`): Prevents pipe pre-creation / hijacking attacks.
+  * `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`): Strictly rejects network/SMB connections.
+
+### 7.2 OS Peer Verification & Mutual Cryptographic Authentication
+1. **OS Identity Verification**:
+   - `GetNamedPipeClientProcessId(hPipe, &client_pid)`
+   - `GetNamedPipeClientSessionId(hPipe, &client_session)`
+   - Inspect client process via `OpenProcess` + `QueryFullProcessImageNameW`: verifies image matches approved `Code.exe`.
+   - Inspect process creation ticks via `GetProcessTimes`.
+   - Inspect client token via `OpenProcessToken`: verifies User SID and Logon SID match Presence server.
+2. **One-Time Pairing**:
+   - Explicit user-initiated command (`presence vscode-pair`).
+   - Generates single-use 256-bit pairing secret (`token_urlsafe(32)`), TTL = 5 minutes.
+   - Extension stores secret in VS Code `context.secrets` (`SecretStorage`).
+   - Presence stores secret in user-scoped protected store.
+3. **Mutual Challenge-Response**:
+   - Presence issues fresh 256-bit `server_nonce`.
+   - Extension replies with `client_nonce` and `HMAC-SHA256(shared_secret, "CLIENT_AUTH" || server_nonce || client_nonce || client_pid || creation_ticks)`.
+   - Presence validates HMAC via `secrets.compare_digest()`, then returns `HMAC-SHA256(shared_secret, "SERVER_AUTH" || server_nonce || client_nonce)`.
+   - Connection is bound to `(client_pid, process_creation_filetime_ticks, nonces)`.
+
+### 7.3 Message Framing & Operation Allowlist
+- **Framing**: Byte pipe with 4-byte big-endian length prefix (`uint32`), max frame 64 KB.
+- **Strict Operation Allowlist**:
+  * `provider.hello`
+  * `provider.get_workspace_metadata` (workspace root path, open folder names, trust state)
+  * `provider.get_active_editor_metadata` (relative file path, language ID; NO file content)
+  * `provider.status`
+  * `provider.shutdown`
+- **Same-User Threat Boundary**: Documented clearly that DACL + Logon SID + Process Identity + HMAC protects against other users, remote attacks, non-paired applications, and cross-session snooping. It does not protect against malware executing arbitrary code inside the same user security context with full access to user memory.
 
 ---
 
-## 8. Resource Management & Measurable Engineering Budgets (P1-03)
+## 8. Resource Management & Measurable Engineering Budgets (P1-03, P2C-20)
 
 Resource values are explicit **Design Targets & Acceptance Ceilings**, to be empirically measured upon implementation:
 
-| Resource Metric | Baseline (Phase 2B.1) | Phase 2C Target Overhead | Max Acceptance Ceiling | Measurement Tool |
+| Resource Metric | Baseline (Phase 2B.1) | Phase 2C Design Target | Max Acceptance Ceiling | Measurement Tool |
 |---|---|---|---|---|
 | **Idle Working Set (WS)** | 64.5 MB | +3.5 MB | < 75.0 MB | Win32 `GetProcessMemoryInfo` |
 | **Idle Private Bytes** | 50.2 MB | +2.0 MB | < 60.0 MB | Win32 `GetProcessMemoryInfo` |
 | **OS Thread Count** | 6 threads | +1 thread (`WinEventHookThread`) | ≤ 8 threads | Toolhelp32 snapshot |
 | **OS Handles (Idle)** | 249 handles | +4 handles (Hook, queue, proc) | < 270 handles | `psutil.Process().num_handles()` |
-| **Idle CPU Utilization** | 0.0% | 0.0% (Zero wakeups) | < 0.1% | `GetSystemTimes` over 60s |
+| **Idle CPU Utilization** | Low | < 0.05% (Event-driven kernel wait) | < 0.1% | `GetSystemTimes` over 5 min soak |
 | **Event Debounce Latency** | N/A | 150 ms | 200 ms | `time.perf_counter()` |
 | **Max Snapshot Size** | N/A | < 4 KB | < 16 KB | Recursive `sys.getsizeof` |
 
@@ -324,8 +343,8 @@ Resource values are explicit **Design Targets & Acceptance Ceilings**, to be emp
 ## 9. Architectural Verification & Acceptance Criteria
 
 Specification 41 is ready for implementation only when all following criteria are satisfied:
-1. **GetWindowTextW Correctness**: Top-level window caption retrieval is implemented using `GetWindowTextW` without synthetic timeouts, reflecting true User32 behavior.
-2. **Composite Window Identity**: All window targeting uses `WindowIdentity` validating HWND, PID, and process creation time.
-3. **Deep Immutability**: All dataclasses enforce deep immutability through primitive/tuple constraints.
-4. **Zero Ambient History**: Ambient context is transient and limited to the single active snapshot; no history ring buffer is retained.
-5. **Clean Unhooking**: Teardown guarantees `UnhookWinEvent`, `WM_QUIT`, and hook thread termination within 500 ms.
+1. **Canonical FILETIME Ticks**: Process creation identity uses exact 64-bit integer tick counts (`process_creation_filetime_ticks`).
+2. **Reentrancy-Safe Hook**: WinEvent callback is minimal, guarded against reentrancy, and places compact records into a bounded queue without blocking.
+3. **Realistic Resource Expectations**: Absolute claims of zero CPU/wakeups are eliminated; realistic event-driven budgets are defined with standardized soak test experiments.
+4. **Hardened Named Pipe IPC**: VS Code named pipe architecture specifies explicit Logon SID DACL, client PID/token checks, mutual HMAC challenge-response, and 64 KB framed message bounds.
+5. **Clean Unhooking**: Teardown guarantees `UnhookWinEvent`, `WM_QUIT`, and hook thread termination within 500 ms without handle leaks.

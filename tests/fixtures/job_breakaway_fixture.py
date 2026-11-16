@@ -1,12 +1,13 @@
 """Adversarial Process Tree & Job Breakaway Fixture
 Native Windows test fixture that attempts to spawn child and grandchild processes
-with CREATE_BREAKAWAY_FROM_JOB (0x01000000) under various Job Object configurations.
+with or without CREATE_BREAKAWAY_FROM_JOB (0x01000000) under various Job Object configurations.
 Reports native Win32 errors, process IDs, and IsProcessInJob membership status.
 """
 
 import sys
 import os
 import json
+import time
 import ctypes
 from ctypes import wintypes
 
@@ -54,11 +55,14 @@ def check_is_in_job(h_process, h_job) -> bool:
     kernel32 = ctypes.windll.kernel32
     is_in = wintypes.BOOL()
     ok = kernel32.IsProcessInJob(h_process, h_job, ctypes.byref(is_in))
+    if not ok:
+        sys.stderr.write(f"IsProcessInJob failed: err={kernel32.GetLastError()} h_proc={h_process} h_job={h_job}\n")
     return bool(ok and is_in.value)
 
 def main():
     if sys.platform != "win32":
-        print(json.dumps({"error": "Not a Windows platform"}))
+        sys.stdout.write(json.dumps({"error": "Not a Windows platform"}) + "\n")
+        sys.stdout.flush()
         return
 
     kernel32 = ctypes.windll.kernel32
@@ -75,7 +79,11 @@ def main():
     mode = sys.argv[3] if len(sys.argv) > 3 else "attempt_breakaway"
 
     h_outer_job = kernel32.OpenJobObjectW(JOB_OBJECT_QUERY, False, outer_job_name) if outer_job_name else None
+    if outer_job_name and not h_outer_job:
+        sys.stderr.write(f"OpenJobObjectW failed for '{outer_job_name}': err={kernel32.GetLastError()}\n")
     h_inner_job = kernel32.OpenJobObjectW(JOB_OBJECT_QUERY, False, inner_job_name) if inner_job_name else None
+    if inner_job_name and not h_inner_job:
+        sys.stderr.write(f"OpenJobObjectW failed for '{inner_job_name}': err={kernel32.GetLastError()}\n")
 
     # Check initial membership of this process
     in_outer = check_is_in_job(h_current_process, h_outer_job) if h_outer_job else None
@@ -88,7 +96,8 @@ def main():
         "fixture_in_outer": in_outer,
         "fixture_in_inner": in_inner,
         "child_pid": None,
-        "breakaway_requested": True,
+        "grandchild_pid": None,
+        "breakaway_requested": False,
         "create_process_success": False,
         "win32_last_error": 0,
         "child_in_outer": None,
@@ -96,8 +105,9 @@ def main():
     }
 
     if mode == "attempt_breakaway":
-        # Attempt to spawn child with CREATE_BREAKAWAY_FROM_JOB
-        cmdline = f'"{sys.executable}" -c "import time; time.sleep(10)"'
+        # Spawn child requesting CREATE_BREAKAWAY_FROM_JOB
+        result["breakaway_requested"] = True
+        cmdline = f'"{sys.executable}" -c "import time; time.sleep(15)"'
         si = STARTUPINFOW()
         si.cb = ctypes.sizeof(STARTUPINFOW)
         pi = PROCESS_INFORMATION()
@@ -123,12 +133,84 @@ def main():
                 result["child_in_outer"] = check_is_in_job(pi.hProcess, h_outer_job)
             if h_inner_job:
                 result["child_in_inner"] = check_is_in_job(pi.hProcess, h_inner_job)
-            # Close handles to child
             kernel32.CloseHandle(pi.hThread)
             kernel32.CloseHandle(pi.hProcess)
         else:
             result["create_process_success"] = False
             result["win32_last_error"] = kernel32.GetLastError()
+
+    elif mode == "standard_spawn":
+        # Spawn child WITHOUT CREATE_BREAKAWAY_FROM_JOB (tests silent breakaway behavior)
+        result["breakaway_requested"] = False
+        cmdline = f'"{sys.executable}" -c "import time; time.sleep(15)"'
+        si = STARTUPINFOW()
+        si.cb = ctypes.sizeof(STARTUPINFOW)
+        pi = PROCESS_INFORMATION()
+
+        flags = CREATE_NO_WINDOW
+        success = kernel32.CreateProcessW(
+            None,
+            ctypes.create_unicode_buffer(cmdline),
+            None,
+            None,
+            False,
+            flags,
+            None,
+            None,
+            ctypes.byref(si),
+            ctypes.byref(pi)
+        )
+
+        if success:
+            result["create_process_success"] = True
+            result["child_pid"] = pi.dwProcessId
+            if h_outer_job:
+                result["child_in_outer"] = check_is_in_job(pi.hProcess, h_outer_job)
+            if h_inner_job:
+                result["child_in_inner"] = check_is_in_job(pi.hProcess, h_inner_job)
+            kernel32.CloseHandle(pi.hThread)
+            kernel32.CloseHandle(pi.hProcess)
+        else:
+            result["create_process_success"] = False
+            result["win32_last_error"] = kernel32.GetLastError()
+
+    elif mode == "spawn_tree":
+        # 3-tier tree: this fixture (Tier 1) spawns child (Tier 2), which spawns grandchild (Tier 3)
+        import subprocess
+        child_code = (
+            "import subprocess, sys, time, os\n"
+            "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdout=subprocess.PIPE)\n"
+            "sys.stdout.write(str(gc.pid) + chr(10))\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        child_proc = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        result["create_process_success"] = True
+        result["child_pid"] = child_proc.pid
+
+        # Read grandchild PID from child's stdout
+        gc_line = child_proc.stdout.readline()
+        if gc_line and gc_line.strip().isdigit():
+            result["grandchild_pid"] = int(gc_line.strip())
+
+        # Keep child and grandchild alive while test controller inspects and terminates outer job
+        # Output result before sleeping
+        sys.stdout.write(json.dumps(result) + "\n")
+        sys.stdout.flush()
+
+        # Close job query handles before sleeping
+        if h_outer_job:
+            kernel32.CloseHandle(h_outer_job)
+        if h_inner_job:
+            kernel32.CloseHandle(h_inner_job)
+
+        time.sleep(30)
+        return
 
     # Close job query handles
     if h_outer_job:

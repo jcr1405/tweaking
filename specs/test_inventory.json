@@ -1,0 +1,78 @@
+{
+  "summary": {
+    "baseline_discovered": 107,
+    "baseline_passed": 105,
+    "baseline_skipped": 2,
+    "baseline_failures": 0,
+    "baseline_errors": 0,
+    "adversarial_discovered": 88,
+    "adversarial_passed": 88,
+    "adversarial_skipped": 0,
+    "adversarial_failures": 0,
+    "adversarial_errors": 0,
+    "combined_discovered": 195,
+    "combined_passed": 193,
+    "combined_skipped": 2,
+    "combined_failures": 0,
+    "combined_errors": 0
+  },
+  "skipped_tests": [
+    {
+      "test_id": "test_gemini_live.TestGeminiLive.test_live_gemini_generation",
+      "reason": "GEMINI_API_KEY environment variable not set. Skipping live test.",
+      "suite": "baseline"
+    },
+    {
+      "test_id": "test_mcp_live.TestMCPLive.test_live_gemini_mcp_invocation",
+      "reason": "GEMINI_API_KEY environment variable not set. Skipping live test.",
+      "suite": "baseline"
+    }
+  ],
+  "baseline_modules": {
+    "test_agent_executor": 7,
+    "test_agent_mcp_integration": 2,
+    "test_artifact_store": 7,
+    "test_commands": 5,
+    "test_conversation": 3,
+    "test_events": 4,
+    "test_gemini_live": 1,
+    "test_journal": 3,
+    "test_lifecycle": 2,
+    "test_mcp_environment_security": 9,
+    "test_mcp_live": 1,
+    "test_mcp_supervisor": 5,
+    "test_mcp_tool_approval": 4,
+    "test_mcp_transport_adapter": 2,
+    "test_permissions": 5,
+    "test_persistence": 3,
+    "test_platform_win32": 3,
+    "test_provider_fake": 5,
+    "test_provider_gemini": 4,
+    "test_reconstruction": 2,
+    "test_schema_cache": 4,
+    "test_summaries": 3,
+    "test_tool_registry": 6,
+    "test_trajectory": 7,
+    "test_win32_job_object": 4,
+    "test_win32_suspended_launcher": 6
+  },
+  "adversarial_modules": {
+    "test_adv_agent_executor": 3,
+    "test_adv_artifact_storage": 5,
+    "test_adv_consent_integrity": 20,
+    "test_adv_handle_security": 1,
+    "test_adv_job_containment": 2,
+    "test_adv_lifecycle_matrix": 9,
+    "test_adv_mcp_transport": 3,
+    "test_adv_nested_job_objects": 8,
+    "test_adv_permissions_security": 3,
+    "test_adv_persistence": 3,
+    "test_adv_repeated_lifecycle": 1,
+    "test_adv_supervisor_lifecycle": 4,
+    "test_adv_transport_backpressure": 8,
+    "test_adv_transport_cancellation": 3,
+    "test_adv_transport_eof": 4,
+    "test_adv_transport_message_limits": 6,
+    "test_adv_win32_launcher": 5
+  }
+}

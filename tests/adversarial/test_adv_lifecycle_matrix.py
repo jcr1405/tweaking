@@ -167,21 +167,59 @@ class TestAdvLifecycleMatrix(unittest.TestCase):
             self.assertFalse(psutil.pid_exists(child_pid), f"Child PID {child_pid} survived parent kill on cycle {i}!")
 
     def test_workload_3_failed_mcp_startups(self):
-        """Workload 3: 25 cycles of failed MCP server startups (non-existent file, invalid cwd)."""
+        """Workload 3: 25 cycles of failed MCP server startups across missing executable,
+        missing script, invalid working directory, and invalid parameters.
+        Verifies:
+        1. Clean error handling (no unhandled exceptions).
+        2. No uncontained or surviving child processes.
+        3. Zero handle or thread leakage.
+        """
         import gc
-        bad_config = MCPServerConfig(
-            server_id="bad_startup_srv",
-            name="Bad Server",
-            command=sys.executable,
-            args=["non_existent_file_xyz_999.py"],
-            startup_timeout=1.0
-        )
         p = psutil.Process(os.getpid())
         h0 = p.num_handles()
 
-        for _ in range(25):
-            s = MCPClientSession(bad_config)
-            s.start()
+        failure_scenarios = [
+            # 1. Missing executable
+            MCPServerConfig(
+                server_id="fail_exe",
+                name="Missing Exe",
+                command="non_existent_binary_xyz_999.exe",
+                args=[],
+                startup_timeout=1.0
+            ),
+            # 2. Missing script
+            MCPServerConfig(
+                server_id="fail_script",
+                name="Missing Script",
+                command=sys.executable,
+                args=["non_existent_script_xyz_999.py"],
+                startup_timeout=1.0
+            ),
+            # 3. Invalid working directory
+            MCPServerConfig(
+                server_id="fail_cwd",
+                name="Invalid CWD",
+                command=sys.executable,
+                args=[str(self.fixture_file)],
+                cwd=r"C:\non_existent_dir_presence_99999",
+                startup_timeout=1.0
+            ),
+            # 4. Immediate exit on boot
+            MCPServerConfig(
+                server_id="fail_immediate_exit",
+                name="Immediate Exit",
+                command=sys.executable,
+                args=["-c", "import sys; sys.exit(1)"],
+                startup_timeout=1.0
+            ),
+        ]
+
+        # Execute 25 failed startup cycles distributed across all failure modes
+        for cycle in range(25):
+            cfg = failure_scenarios[cycle % len(failure_scenarios)]
+            s = MCPClientSession(cfg)
+            started = s.start()
+            self.assertFalse(started, f"Session unexpectedly succeeded on failure scenario {cfg.name}")
             s.stop()
 
         gc.collect()
@@ -228,6 +266,90 @@ class TestAdvLifecycleMatrix(unittest.TestCase):
             res = supervisor.execute_tool("crash_test_srv", "crash", {})
             self.assertEqual(res.get("status"), "ERROR")
             supervisor.stop_server("crash_test_srv")
+
+        supervisor.stop_all()
+
+    def test_workload_4b_non_idempotent_side_effect_no_blind_replay(self):
+        """Part 7.5 Critical Verification: Proves that when an MCP server crashes during or immediately
+        after executing an operation with observable side effects, the supervisor does NOT blindly replay it.
+        Sequence:
+        1. Operation writes unique ID to persistent log file.
+        2. Server crashes with os._exit(99) before returning response.
+        3. Supervisor detects crash and restarts server to restore availability.
+        4. Supervisor returns ERROR (fail closed, no blind replay).
+        5. Assert persistent log contains EXACTLY ONE side-effect entry, never duplicates.
+        """
+        side_effect_log = Path(self.temp_dir) / "side_effects.log"
+        if side_effect_log.exists():
+            side_effect_log.unlink()
+
+        server_code = (
+            "import sys, json, os\n"
+            "log_path = sys.argv[1]\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    mid = req.get('id')\n"
+            "    m = req.get('method')\n"
+            "    if m == 'initialize':\n"
+            "        resp = {'jsonrpc': '2.0', 'id': mid, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'mut', 'version': '1'}}}\n"
+            "        sys.stdout.write(json.dumps(resp) + chr(10))\n"
+            "        sys.stdout.flush()\n"
+            "    elif m == 'tools/list':\n"
+            "        resp = {'jsonrpc': '2.0', 'id': mid, 'result': {'tools': [\n"
+            "            {'name': 'mutating_tool', 'description': 'mutates and crashes', 'inputSchema': {'type': 'object'}},\n"
+            "            {'name': 'safe_tool', 'description': 'safe', 'inputSchema': {'type': 'object'}}\n"
+            "        ]}}\n"
+            "        sys.stdout.write(json.dumps(resp) + chr(10))\n"
+            "        sys.stdout.flush()\n"
+            "    elif m == 'tools/call':\n"
+            "        tname = req.get('params', {}).get('name')\n"
+            "        args = req.get('params', {}).get('arguments', {})\n"
+            "        if tname == 'mutating_tool':\n"
+            "            op_id = args.get('op_id', 'unknown')\n"
+            "            # Execute observable side effect: append op_id to file\n"
+            "            with open(log_path, 'a', encoding='utf-8') as f:\n"
+            "                f.write(op_id + chr(10))\n"
+            "            # Crash immediately before returning JSON-RPC response\n"
+            "            os._exit(99)\n"
+            "        elif tname == 'safe_tool':\n"
+            "            resp = {'jsonrpc': '2.0', 'id': mid, 'result': {'content': [{'type': 'text', 'text': 'SAFE_OK'}]}}\n"
+            "            sys.stdout.write(json.dumps(resp) + chr(10))\n"
+            "            sys.stdout.flush()\n"
+        )
+        srv_file = Path(self.temp_dir) / "side_effect_srv.py"
+        srv_file.write_text(server_code, encoding="utf-8")
+
+        cache = SchemaCache(cache_dir=Path(self.temp_dir) / "schemas")
+        supervisor = MCPSupervisor(schema_cache=cache)
+        cfg = MCPServerConfig(
+            server_id="side_effect_srv",
+            name="Side Effect Server",
+            command=sys.executable,
+            args=[str(srv_file), str(side_effect_log)],
+            startup_timeout=2.0,
+            request_timeout=2.0,
+            approved_tools=["mutating_tool", "safe_tool"]
+        )
+        supervisor.register_server(cfg)
+
+        unique_op_id = "OPERATION_TX_777888"
+        # Dispatch non-idempotent operation
+        res = supervisor.execute_tool("side_effect_srv", "mutating_tool", {"op_id": unique_op_id})
+
+        # 1. Assert supervisor returned error status and identified crash
+        self.assertEqual(res.get("status"), "ERROR")
+        self.assertTrue(res.get("server_crashed"), "Supervisor did not flag server crash")
+        self.assertIn("NOT replayed", res.get("error", ""))
+
+        # 2. Check persistent side effect log: must contain EXACTLY ONE record
+        self.assertTrue(side_effect_log.exists(), "Side effect was not recorded before crash")
+        lines = side_effect_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines.count(unique_op_id), 1, f"Expected exactly 1 execution of {unique_op_id}, but found {lines.count(unique_op_id)}!")
+
+        # 3. Verify server was cleanly restarted by supervisor and subsequent safe calls succeed
+        safe_res = supervisor.execute_tool("side_effect_srv", "safe_tool", {})
+        self.assertEqual(safe_res.get("status"), "SUCCESS")
+        self.assertEqual(safe_res.get("result"), "SAFE_OK")
 
         supervisor.stop_all()
 

@@ -97,11 +97,20 @@ class ToolRegistry:
                 requires_explicit_consent=(tool.authority_tier == PermissionTier.L3_PROTECTED)
             ))
 
+        # Validate explicit user consent token if provided (cryptographic single-use verification)
+        granted_consent = False
+        if consent_token:
+            granted_consent = permission_boundary.verify_consent_token(
+                token=consent_token,
+                action_name=tool.tool_id,
+                context=args
+            )
+
         # Authorize against the 4-tier permission boundary
         auth: AuthorizationResult = permission_boundary.check_permission(
             action_name=tool.tool_id,
             context=args,
-            granted_consent=bool(consent_token)
+            granted_consent=granted_consent
         )
 
         if not auth.allowed:

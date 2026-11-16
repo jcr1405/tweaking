@@ -20,7 +20,8 @@ ENV/
 data/
 logs/
 conversations/
-artifacts/
+/artifacts/
+!runtime/artifacts/
 messages/
 mcp/schemas/
 

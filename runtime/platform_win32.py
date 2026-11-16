@@ -532,6 +532,20 @@ class Win32SuspendedLauncher:
 
         kernel32 = ctypes.windll.kernel32
 
+        # Explicitly configure 64-bit Win32 argtypes and restype for process creation & containment
+        kernel32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p, wintypes.DWORD]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+        kernel32.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+        kernel32.SetHandleInformation.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+
         # 1. Resolve executable path
         resolved_exe = shutil.which(command)
         if not resolved_exe:
@@ -675,17 +689,26 @@ class Win32SuspendedLauncher:
             kernel32.CloseHandle(h_stderr_read)
             raise RuntimeError(f"AssignProcessToJobObject failed for PID {pi.dwProcessId}: Win32 error {err}. Process terminated safely.")
 
-        # 10. Verify Assignment using IsProcessInJob
+        # 10. Verify Assignment using IsProcessInJob (Fail-Closed)
         is_in_job = wintypes.BOOL()
-        if kernel32.IsProcessInJob(pi.hProcess, active_job.handle, ctypes.byref(is_in_job)):
-            if not is_in_job:
-                kernel32.TerminateProcess(pi.hProcess, 1)
-                kernel32.CloseHandle(pi.hThread)
-                kernel32.CloseHandle(pi.hProcess)
-                kernel32.CloseHandle(h_stdin_write)
-                kernel32.CloseHandle(h_stdout_read)
-                kernel32.CloseHandle(h_stderr_read)
-                raise RuntimeError(f"Security invariant violated: Process {pi.dwProcessId} is not member of Job Object '{active_job.name}'. Terminated.")
+        call_success = kernel32.IsProcessInJob(pi.hProcess, active_job.handle, ctypes.byref(is_in_job))
+        if not call_success or not is_in_job.value:
+            err = kernel32.GetLastError()
+            kernel32.TerminateProcess(pi.hProcess, 1)
+            kernel32.CloseHandle(pi.hThread)
+            kernel32.CloseHandle(pi.hProcess)
+            kernel32.CloseHandle(h_stdin_write)
+            kernel32.CloseHandle(h_stdout_read)
+            kernel32.CloseHandle(h_stderr_read)
+            if not call_success:
+                raise RuntimeError(
+                    f"Security invariant violated: IsProcessInJob verification failed for PID {pi.dwProcessId} "
+                    f"(Win32 error {err}). Process terminated safely."
+                )
+            else:
+                raise RuntimeError(
+                    f"Security invariant violated: Process {pi.dwProcessId} is not member of Job Object '{active_job.name}'. Terminated."
+                )
 
         # 11. Resume primary thread
         prev_suspend_count = kernel32.ResumeThread(pi.hThread)

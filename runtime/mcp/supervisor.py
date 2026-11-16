@@ -5,6 +5,7 @@ exponential restart backoff, and ToolRegistry registration for all configured MC
 
 import time
 import logging
+import threading
 from typing import Optional, Dict, Any, List, Callable
 from pathlib import Path
 
@@ -33,6 +34,15 @@ class MCPSupervisor:
         self._sessions: Dict[str, MCPClientSession] = {}
         self._restart_counts: Dict[str, int] = {}
         self._discovered_tools: Dict[str, Dict[str, MCPToolInfo]] = {}
+        self._server_locks: Dict[str, threading.RLock] = {}
+        self._global_lock = threading.Lock()
+
+    def _get_server_lock(self, server_id: str) -> threading.RLock:
+        """Returns or creates a re-entrant lock for the specified server."""
+        with self._global_lock:
+            if server_id not in self._server_locks:
+                self._server_locks[server_id] = threading.RLock()
+            return self._server_locks[server_id]
 
     def register_server(self, config: MCPServerConfig) -> None:
         """Registers a server configuration with the supervisor."""
@@ -69,75 +79,78 @@ class MCPSupervisor:
 
     def start_server(self, server_id: str) -> bool:
         """Starts an MCP server process, discovers its tools, and caches schemas."""
-        config = self._configs.get(server_id)
-        if not config:
-            logger.error(f"Cannot start unknown MCP server '{server_id}'")
-            return False
+        with self._get_server_lock(server_id):
+            config = self._configs.get(server_id)
+            if not config:
+                logger.error(f"Cannot start unknown MCP server '{server_id}'")
+                return False
 
-        if not config.enabled:
-            logger.warning(f"MCP server '{server_id}' is disabled in configuration.")
-            return False
+            if not config.enabled:
+                logger.warning(f"MCP server '{server_id}' is disabled in configuration.")
+                return False
 
-        # If already running, return True
-        session = self._sessions.get(server_id)
-        if session and session.state == MCPServerState.READY and session.is_alive():
+            # If already running, return True
+            session = self._sessions.get(server_id)
+            if session and session.state == MCPServerState.READY and session.is_alive():
+                return True
+
+            # Stop any stale session
+            if session:
+                session.stop()
+
+            logger.info(f"Starting MCP server '{server_id}'...")
+            new_session = MCPClientSession(config)
+            self._sessions[server_id] = new_session
+
+            success = new_session.start()
+            if not success:
+                logger.error(f"Failed to start MCP server '{server_id}' (State: {new_session.state.value})")
+                return False
+
+            # Discover and cache tools
+            tools = new_session.list_tools()
+            for t in tools:
+                t.approved = config.is_tool_approved(t.tool_name)
+            self._discovered_tools[server_id] = {t.tool_name: t for t in tools}
+            self.schema_cache.save_server_schemas(server_id, tools)
+            logger.info(f"MCP server '{server_id}' started successfully with {len(tools)} tool(s).")
             return True
-
-        # Stop any stale session
-        if session:
-            session.stop()
-
-        logger.info(f"Starting MCP server '{server_id}'...")
-        new_session = MCPClientSession(config)
-        self._sessions[server_id] = new_session
-
-        success = new_session.start()
-        if not success:
-            logger.error(f"Failed to start MCP server '{server_id}' (State: {new_session.state.value})")
-            return False
-
-        # Discover and cache tools
-        tools = new_session.list_tools()
-        for t in tools:
-            t.approved = config.is_tool_approved(t.tool_name)
-        self._discovered_tools[server_id] = {t.tool_name: t for t in tools}
-        self.schema_cache.save_server_schemas(server_id, tools)
-        logger.info(f"MCP server '{server_id}' started successfully with {len(tools)} tool(s).")
-        return True
 
     def stop_server(self, server_id: str) -> bool:
         """Gracefully stops an MCP server process tree."""
-        session = self._sessions.get(server_id)
-        if not session:
-            return True
-        logger.info(f"Stopping MCP server '{server_id}'...")
-        result = session.stop()
-        return result
+        with self._get_server_lock(server_id):
+            session = self._sessions.get(server_id)
+            if not session:
+                return True
+            logger.info(f"Stopping MCP server '{server_id}'...")
+            result = session.stop()
+            return result
 
     def restart_server(self, server_id: str) -> bool:
         """Restarts an MCP server with backoff tracking."""
-        config = self._configs.get(server_id)
-        if not config:
-            return False
+        with self._get_server_lock(server_id):
+            config = self._configs.get(server_id)
+            if not config:
+                return False
 
-        restarts = self._restart_counts.get(server_id, 0)
-        if restarts >= config.max_restarts:
-            logger.error(f"MCP server '{server_id}' reached maximum restart limit ({config.max_restarts}). Marking FAILED.")
-            session = self._sessions.get(server_id)
-            if session:
-                session.state = MCPServerState.FAILED
-            return False
+            restarts = self._restart_counts.get(server_id, 0)
+            if restarts >= config.max_restarts:
+                logger.error(f"MCP server '{server_id}' reached maximum restart limit ({config.max_restarts}). Marking FAILED.")
+                session = self._sessions.get(server_id)
+                if session:
+                    session.state = MCPServerState.FAILED
+                return False
 
-        # Exponential backoff
-        backoff = config.restart_backoff_seconds * (2 ** restarts)
-        logger.warning(f"Restarting MCP server '{server_id}' (attempt {restarts + 1}/{config.max_restarts}, backoff: {backoff:.1f}s)...")
-        time.sleep(backoff)
+            # Exponential backoff
+            backoff = config.restart_backoff_seconds * (2 ** restarts)
+            logger.warning(f"Restarting MCP server '{server_id}' (attempt {restarts + 1}/{config.max_restarts}, backoff: {backoff:.1f}s)...")
+            time.sleep(backoff)
 
-        self.stop_server(server_id)
-        self._restart_counts[server_id] = restarts + 1
+            self.stop_server(server_id)
+            self._restart_counts[server_id] = restarts + 1
 
-        success = self.start_server(server_id)
-        return success
+            success = self.start_server(server_id)
+            return success
 
     def start_all(self) -> None:
         """Starts all enabled servers."""
@@ -152,46 +165,51 @@ class MCPSupervisor:
 
     def execute_tool(self, server_id: str, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes a tool on an MCP server with automatic lazy startup, crash recovery, and approval checks."""
-        config = self._configs.get(server_id)
-        if not config:
-            return {"status": "ERROR", "error": f"MCP server '{server_id}' is not configured."}
+        with self._get_server_lock(server_id):
+            config = self._configs.get(server_id)
+            if not config:
+                return {"status": "ERROR", "error": f"MCP server '{server_id}' is not configured."}
 
-        # Check explicit tool approval policy (default-deny)
-        if not config.is_tool_approved(tool_name):
-            logger.warning(f"Rejected execution of unapproved MCP tool '{tool_name}' on server '{server_id}' (default-deny).")
-            return {
-                "status": "ERROR",
-                "error": f"Tool '{tool_name}' on MCP server '{server_id}' is unapproved (default-deny policy).",
-                "server_id": server_id,
-                "tool": tool_name
-            }
-
-        # Lazy startup if not currently running
-        session = self._sessions.get(server_id)
-        if not session or not session.is_alive() or session.state != MCPServerState.READY:
-            logger.info(f"Lazy-starting MCP server '{server_id}' for tool call '{tool_name}'...")
-            started = self.start_server(server_id)
-            if not started:
+            # Check explicit tool approval policy (default-deny)
+            if not config.is_tool_approved(tool_name):
+                logger.warning(f"Rejected execution of unapproved MCP tool '{tool_name}' on server '{server_id}' (default-deny).")
                 return {
                     "status": "ERROR",
-                    "error": f"Failed to start MCP server '{server_id}' to execute tool '{tool_name}'."
+                    "error": f"Tool '{tool_name}' on MCP server '{server_id}' is unapproved (default-deny policy).",
+                    "server_id": server_id,
+                    "tool": tool_name
                 }
+
+            # Lazy startup if not currently running
             session = self._sessions.get(server_id)
-
-        # Execute call
-        result = session.call_tool(tool_name, args, timeout=config.request_timeout)
-
-        # Check for crash during execution
-        if result.get("status") == "ERROR" and (not session.is_alive() or session.state != MCPServerState.READY):
-            logger.warning(f"MCP server '{server_id}' crashed or exited during execution of tool '{tool_name}'.")
-            # Attempt restart and retry if within restart quota
-            if self.restart_server(server_id):
+            if not session or not session.is_alive() or session.state != MCPServerState.READY:
+                logger.info(f"Lazy-starting MCP server '{server_id}' for tool call '{tool_name}'...")
+                started = self.start_server(server_id)
+                if not started:
+                    return {
+                        "status": "ERROR",
+                        "error": f"Failed to start MCP server '{server_id}' to execute tool '{tool_name}'."
+                    }
                 session = self._sessions.get(server_id)
-                if tool_name != "trigger_crash":
-                    logger.info(f"Retrying tool '{tool_name}' on restarted MCP server '{server_id}'...")
-                    result = session.call_tool(tool_name, args, timeout=config.request_timeout)
 
-        return result
+            # Execute call
+            result = session.call_tool(tool_name, args, timeout=config.request_timeout)
+
+            # Check for crash during execution
+            if result.get("status") == "ERROR" and (not session.is_alive() or session.state != MCPServerState.READY):
+                logger.warning(f"MCP server '{server_id}' crashed or exited during execution of tool '{tool_name}'.")
+                # Restart server in background to restore availability for subsequent calls
+                self.restart_server(server_id)
+                # Fail closed: Do NOT blindly retry non-idempotent tool mutations on crash
+                return {
+                    "status": "ERROR",
+                    "error": f"MCP server '{server_id}' crashed or terminated during execution of tool '{tool_name}'. Tool execution was NOT replayed to prevent non-idempotent mutation hazards.",
+                    "server_id": server_id,
+                    "tool": tool_name,
+                    "server_crashed": True
+                }
+
+            return result
 
     def register_tools_with_registry(
         self,

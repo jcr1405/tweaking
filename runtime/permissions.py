@@ -5,6 +5,8 @@ Models and user commands are untrusted; all actions must be formally authorized.
 
 from enum import IntEnum, unique
 import logging
+import time
+import secrets
 from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass
 
@@ -46,6 +48,14 @@ class AuthorizationResult:
     user_consent_required: bool = False
 
 
+@dataclass(frozen=True)
+class IssuedConsent:
+    token: str
+    action_name: str
+    expires_at: float
+    context_keys: tuple
+
+
 ConsentProvider = Callable[[str, Dict[str, Any]], bool]
 
 
@@ -55,7 +65,53 @@ class PermissionBoundary:
     def __init__(self, consent_provider: Optional[ConsentProvider] = None):
         self._policies: Dict[str, ActionPolicy] = {}
         self._consent_provider = consent_provider
+        self._active_consent_tokens: Dict[str, IssuedConsent] = {}
         self._register_default_policies()
+
+    def issue_consent_token(
+        self,
+        action_name: str,
+        context: Optional[Dict[str, Any]] = None,
+        ttl_seconds: float = 60.0
+    ) -> str:
+        """Issues a single-use cryptographically random consent token for an action."""
+        token = f"cst_{secrets.token_urlsafe(32)}"
+        context_keys = tuple(sorted(context.keys())) if context else ()
+        self._active_consent_tokens[token] = IssuedConsent(
+            token=token,
+            action_name=action_name,
+            expires_at=time.time() + ttl_seconds,
+            context_keys=context_keys
+        )
+        logger.info(f"Issued single-use consent token for '{action_name}' (TTL: {ttl_seconds}s)")
+        return token
+
+    def verify_consent_token(
+        self,
+        token: str,
+        action_name: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Verifies and consumes a single-use consent token. Returns True if valid, False otherwise."""
+        if not token or not isinstance(token, str):
+            return False
+
+        consent = self._active_consent_tokens.pop(token, None)
+        if not consent:
+            logger.warning(f"Invalid or already-consumed consent token presented for action '{action_name}'.")
+            return False
+
+        now = time.time()
+        if now > consent.expires_at:
+            logger.warning(f"Expired consent token presented for action '{action_name}' (expired {now - consent.expires_at:.1f}s ago).")
+            return False
+
+        if consent.action_name != action_name:
+            logger.warning(f"Consent token action mismatch: expected '{consent.action_name}', got '{action_name}'.")
+            return False
+
+        logger.info(f"Verified and consumed valid consent token for '{action_name}'.")
+        return True
 
     def _register_default_policies(self) -> None:
         """Registers foundational action policies for the runtime."""

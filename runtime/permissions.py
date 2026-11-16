@@ -4,9 +4,12 @@ Models and user commands are untrusted; all actions must be formally authorized.
 """
 
 from enum import IntEnum, unique
+import json
 import logging
 import time
 import secrets
+import hashlib
+import threading
 from typing import Dict, Optional, Any, Callable
 from dataclasses import dataclass
 
@@ -48,12 +51,38 @@ class AuthorizationResult:
     user_consent_required: bool = False
 
 
+def canonicalize_arguments(args: Optional[Dict[str, Any]]) -> str:
+    """Produces a deterministic, canonical JSON representation of tool arguments.
+    Sorts all dictionary keys recursively and enforces strict comma/colon separators.
+    Rejects non-finite floating point numbers (NaN, Infinity).
+    """
+    if args is None:
+        return "{}"
+    if not isinstance(args, dict):
+        raise ValueError(f"Tool arguments must be a dictionary, got {type(args).__name__}")
+    return json.dumps(
+        args,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False
+    )
+
+
+def compute_argument_hash(args: Optional[Dict[str, Any]]) -> str:
+    """Computes a SHA-256 hex digest of the canonicalized argument representation."""
+    canonical_json = canonicalize_arguments(args)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class IssuedConsent:
-    token: str
+    token_hash: str
     action_name: str
+    argument_hash: str
+    conversation_id: str
+    tier: AuthorityLevel
     expires_at: float
-    context_keys: tuple
 
 
 ConsentProvider = Callable[[str, Dict[str, Any]], bool]
@@ -66,48 +95,101 @@ class PermissionBoundary:
         self._policies: Dict[str, ActionPolicy] = {}
         self._consent_provider = consent_provider
         self._active_consent_tokens: Dict[str, IssuedConsent] = {}
+        self._lock = threading.Lock()
         self._register_default_policies()
+
+    def _cleanup_expired_tokens_locked(self, now: Optional[float] = None) -> None:
+        """Purges expired consent tokens from the internal registry."""
+        curr_time = now or time.monotonic()
+        expired_keys = [k for k, v in self._active_consent_tokens.items() if curr_time > v.expires_at]
+        for k in expired_keys:
+            del self._active_consent_tokens[k]
 
     def issue_consent_token(
         self,
         action_name: str,
         context: Optional[Dict[str, Any]] = None,
+        conversation_id: str = "",
         ttl_seconds: float = 60.0
     ) -> str:
-        """Issues a single-use cryptographically random consent token for an action."""
-        token = f"cst_{secrets.token_urlsafe(32)}"
-        context_keys = tuple(sorted(context.keys())) if context else ()
-        self._active_consent_tokens[token] = IssuedConsent(
-            token=token,
-            action_name=action_name,
-            expires_at=time.time() + ttl_seconds,
-            context_keys=context_keys
+        """Issues a single-use cryptographically random consent token bound to exact arguments."""
+        raw_token = f"cst_{secrets.token_urlsafe(32)}"
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        arg_hash = compute_argument_hash(context)
+
+        policy = self._policies.get(action_name)
+        tier = policy.required_level if policy else AuthorityLevel.L3_PROTECTED
+
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_expired_tokens_locked(now)
+            self._active_consent_tokens[token_hash] = IssuedConsent(
+                token_hash=token_hash,
+                action_name=action_name,
+                argument_hash=arg_hash,
+                conversation_id=conversation_id,
+                tier=tier,
+                expires_at=now + ttl_seconds
+            )
+        logger.info(
+            f"Issued single-use consent token for '{action_name}' "
+            f"[arg_digest={arg_hash[:8]}...] (TTL: {ttl_seconds}s)"
         )
-        logger.info(f"Issued single-use consent token for '{action_name}' (TTL: {ttl_seconds}s)")
-        return token
+        return raw_token
 
     def verify_consent_token(
         self,
         token: str,
         action_name: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        conversation_id: str = ""
     ) -> bool:
-        """Verifies and consumes a single-use consent token. Returns True if valid, False otherwise."""
+        """Atomically verifies and consumes a single-use consent token with strict argument validation."""
         if not token or not isinstance(token, str):
             return False
 
-        consent = self._active_consent_tokens.pop(token, None)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        now = time.monotonic()
+
+        with self._lock:
+            consent = self._active_consent_tokens.pop(token_hash, None)
+
         if not consent:
             logger.warning(f"Invalid or already-consumed consent token presented for action '{action_name}'.")
             return False
 
-        now = time.time()
         if now > consent.expires_at:
-            logger.warning(f"Expired consent token presented for action '{action_name}' (expired {now - consent.expires_at:.1f}s ago).")
+            logger.warning(
+                f"Expired consent token presented for action '{action_name}' "
+                f"(expired {now - consent.expires_at:.1f}s ago)."
+            )
             return False
 
         if consent.action_name != action_name:
-            logger.warning(f"Consent token action mismatch: expected '{consent.action_name}', got '{action_name}'.")
+            logger.warning(
+                f"Consent token action mismatch: expected '{consent.action_name}', got '{action_name}'."
+            )
+            return False
+
+        # Strict canonical argument validation
+        try:
+            presented_arg_hash = compute_argument_hash(context)
+        except Exception as e:
+            logger.warning(f"Failed to canonicalize presented arguments for '{action_name}': {e}")
+            return False
+
+        if consent.argument_hash != presented_arg_hash:
+            logger.warning(
+                f"Consent token argument mismatch for '{action_name}': "
+                f"approved args digest ({consent.argument_hash[:8]}...) did not match "
+                f"presented args digest ({presented_arg_hash[:8]}...)."
+            )
+            return False
+
+        if consent.conversation_id and conversation_id and consent.conversation_id != conversation_id:
+            logger.warning(
+                f"Consent token conversation mismatch: expected '{consent.conversation_id}', got '{conversation_id}'."
+            )
             return False
 
         logger.info(f"Verified and consumed valid consent token for '{action_name}'.")

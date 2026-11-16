@@ -25,6 +25,10 @@ from runtime.platform_win32 import Win32JobObject, Win32SuspendedLauncher, Win32
 
 logger = logging.getLogger("presence.mcp.transport")
 
+# Maximum line length permitted for JSON-RPC messages from MCP subprocesses (16 MB)
+MAX_MESSAGE_LINE_LENGTH_BYTES = 16 * 1024 * 1024
+MAX_STDERR_LINE_LENGTH_BYTES = 64 * 1024
+
 
 def parse_session_message(line: str) -> SessionMessage | Exception:
     """Parses a single JSON-RPC line into an MCP SessionMessage or returns parse exception."""
@@ -74,6 +78,11 @@ async def win32_mcp_stdio_transport(
         try:
             async with read_stream_writer:
                 async for chunk in text_stream:
+                    if len(buffer) + len(chunk) > MAX_MESSAGE_LINE_LENGTH_BYTES:
+                        err = ValueError(f"MCP stdout message line exceeded buffer ceiling ({MAX_MESSAGE_LINE_LENGTH_BYTES} bytes)")
+                        logger.error(str(err))
+                        await read_stream_writer.send(err)
+                        return
                     lines = (buffer + chunk).split("\n")
                     buffer = lines.pop()
                     for line in lines:
@@ -96,12 +105,15 @@ async def win32_mcp_stdio_transport(
         buffer = ""
         try:
             async for chunk in text_stream:
+                if len(buffer) > MAX_STDERR_LINE_LENGTH_BYTES:
+                    logger.warning(f"[MCP-STDERR:{proc.pid}] {buffer[:1024]}... [TRUNCATED OVERSIZED STDERR LINE]")
+                    buffer = ""
                 lines = (buffer + chunk).split("\n")
                 buffer = lines.pop()
                 for line in lines:
                     clean_line = line.strip("\r")
                     if clean_line:
-                        logger.warning(f"[MCP-STDERR:{proc.pid}] {clean_line}")
+                        logger.warning(f"[MCP-STDERR:{proc.pid}] {clean_line[:MAX_STDERR_LINE_LENGTH_BYTES]}")
         except Exception:
             pass
 

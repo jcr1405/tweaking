@@ -221,7 +221,7 @@ class MCPClientSession:
         self._session: Optional[ClientSession] = None
         self._ready_event = threading.Event()
         self._stop_event: Optional[asyncio.Event] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def start(self) -> bool:
         """Starts the MCP server subprocess inside a Win32 Job Object and initializes protocol."""
@@ -261,11 +261,14 @@ class MCPClientSession:
                 logger.error(err)
                 self.state = MCPServerState.FAILED
                 self.last_error = err
-                self._terminate_subprocesses()
-                return False
+            self.stop()
+            return False
 
-        with self._lock:
-            return self.state == MCPServerState.READY
+        if self.state != MCPServerState.READY:
+            self.stop()
+            return False
+
+        return True
 
     def _run_loop(self) -> None:
         """Background thread target that manages the asyncio event loop."""
@@ -279,6 +282,7 @@ class MCPClientSession:
                 self.state = MCPServerState.FAILED
                 self.last_error = str(e)
         finally:
+            self._terminate_subprocesses()
             with self._lock:
                 if self.state != MCPServerState.STOPPED:
                     self.state = MCPServerState.STOPPED
@@ -464,19 +468,27 @@ class MCPClientSession:
     def stop(self) -> bool:
         """Gracefully shuts down the MCP session and ensures process tree termination."""
         with self._lock:
-            if self.state in (MCPServerState.STOPPED, MCPServerState.STOPPING):
+            if self.state == MCPServerState.STOPPING:
                 return True
-            self.state = MCPServerState.STOPPING
+            was_already_stopped = (self.state == MCPServerState.STOPPED)
+            if not was_already_stopped:
+                self.state = MCPServerState.STOPPING
 
-        logger.info(f"Stopping MCP server '{self.config.server_id}'...")
+        if not was_already_stopped:
+            logger.info(f"Stopping MCP server '{self.config.server_id}'...")
 
-        # Signal stop event in async loop
-        if self._loop and self._loop.is_running() and self._stop_event:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+            # Signal stop event in async loop
+            if self._loop and self._loop.is_running() and self._stop_event:
+                try:
+                    self._loop.call_soon_threadsafe(self._stop_event.set)
+                except Exception:
+                    pass
 
-        # Wait for thread to exit cleanly
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=self.config.shutdown_timeout)
+        # Always wait for thread to exit cleanly if alive
+        if self._thread:
+            if self._thread.is_alive():
+                self._thread.join(timeout=self.config.shutdown_timeout)
+            self._thread = None
 
         # Force terminate if still running
         self._terminate_subprocesses()
@@ -491,17 +503,20 @@ class MCPClientSession:
         return True
 
     def _terminate_subprocesses(self) -> None:
-        """Terminates processes via Win32 Job Object and closes handle."""
-        if self._job:
+        """Terminates processes via Win32 Job Object and closes handle atomically."""
+        with self._lock:
+            job = self._job
+            self._job = None
+
+        if job:
             try:
-                self._job.terminate(exit_code=0)
+                job.terminate(exit_code=0)
             except Exception as e:
                 logger.warning(f"Error terminating Job Object for '{self.config.server_id}': {e}")
             try:
-                self._job.close()
+                job.close()
             except Exception as e:
                 logger.warning(f"Error closing Job Object for '{self.config.server_id}': {e}")
-            self._job = None
 
     def _cleanup_loop(self) -> None:
         """Closes event loop safely."""

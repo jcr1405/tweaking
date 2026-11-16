@@ -76,7 +76,8 @@ class ToolRegistry:
         tool_id: str,
         args: Dict[str, Any],
         permission_boundary: PermissionBoundary,
-        consent_token: Optional[str] = None
+        consent_token: Optional[str] = None,
+        conversation_id: str = ""
     ) -> Dict[str, Any]:
         """Validates, authorizes, and executes a requested tool.
         Returns a structured result envelope:
@@ -103,7 +104,8 @@ class ToolRegistry:
             granted_consent = permission_boundary.verify_consent_token(
                 token=consent_token,
                 action_name=tool.tool_id,
-                context=args
+                context=args,
+                conversation_id=conversation_id
             )
 
         # Authorize against the 4-tier permission boundary

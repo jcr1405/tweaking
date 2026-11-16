@@ -404,6 +404,7 @@ class Win32SuspendedProcess:
         self._h_stdout_read = h_stdout_read
         self._h_stderr_read = h_stderr_read
         self._closed = False
+        self._exit_code: Optional[int] = None
 
         if sys.platform == "win32":
             import msvcrt
@@ -432,6 +433,8 @@ class Win32SuspendedProcess:
 
     def poll(self) -> Optional[int]:
         """Checks if process has terminated without blocking. Returns exit code or None."""
+        if self._exit_code is not None:
+            return self._exit_code
         if sys.platform != "win32" or not self._h_process:
             return None
 
@@ -446,11 +449,14 @@ class Win32SuspendedProcess:
                 # Double-check WaitForSingleObject to confirm true still-active vs exit code 259
                 if kernel32.WaitForSingleObject(self._h_process, 0) == WAIT_TIMEOUT:
                     return None
-            return exit_code.value
+            self._exit_code = exit_code.value
+            return self._exit_code
         return None
 
     def wait(self, timeout_ms: int = 5000) -> Optional[int]:
         """Waits up to timeout_ms for process to exit and returns exit code."""
+        if self._exit_code is not None:
+            return self._exit_code
         if sys.platform != "win32" or not self._h_process:
             return None
 
@@ -461,7 +467,8 @@ class Win32SuspendedProcess:
 
         exit_code = wintypes.DWORD()
         if kernel32.GetExitCodeProcess(self._h_process, ctypes.byref(exit_code)):
-            return exit_code.value
+            self._exit_code = exit_code.value
+            return self._exit_code
         return None
 
     def terminate(self, exit_code: int = 1) -> bool:
@@ -474,7 +481,9 @@ class Win32SuspendedProcess:
         if self.job and self.job.is_active:
             self.job.terminate(exit_code=exit_code)
         # Terminate root process directly as well
-        return bool(kernel32.TerminateProcess(self._h_process, wintypes.UINT(exit_code)))
+        res = bool(kernel32.TerminateProcess(self._h_process, wintypes.UINT(exit_code)))
+        self.wait(timeout_ms=1000)
+        return res
 
     def close(self) -> None:
         """Deterministically closes all open file handles and the process handle."""
@@ -490,8 +499,9 @@ class Win32SuspendedProcess:
                 except Exception:
                     pass
 
-        # Close process handle
+        # Close process handle after recording final exit code
         if sys.platform == "win32" and self._h_process:
+            self.wait(timeout_ms=500)
             kernel32 = ctypes.windll.kernel32
             kernel32.CloseHandle(self._h_process)
             self._h_process = None

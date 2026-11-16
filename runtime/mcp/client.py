@@ -12,14 +12,12 @@ import logging
 import asyncio
 import threading
 from typing import Optional, Dict, Any, List
-from unittest.mock import patch
 
-from mcp.client.stdio import stdio_client, StdioServerParameters
-import mcp.client.stdio as mcp_stdio_mod
 from mcp import ClientSession
 
 from runtime.mcp.models import MCPServerConfig, MCPServerState, MCPToolInfo, MCPServerStatus
 from runtime.platform_win32 import Win32JobObject
+from runtime.mcp.transport import win32_mcp_stdio_transport
 
 logger = logging.getLogger("presence.mcp.client")
 
@@ -291,58 +289,43 @@ class MCPClientSession:
         self._stop_event = asyncio.Event()
 
         # Build isolated environment
-        isolated_env = build_isolated_environment(self.config.env)
-
-        params = StdioServerParameters(
-            command=self.config.command,
-            args=self.config.args,
-            env=isolated_env,
-            cwd=self.config.cwd
-        )
-
-        # Hook process creation to capture PID and assign to Win32 Job Object
-        orig_create = mcp_stdio_mod._create_platform_compatible_process
-
-        async def hook_create_process(*args, **kwargs):
-            proc = await orig_create(*args, **kwargs)
-            self.pid = proc.pid
-            logger.info(f"Spawned MCP server '{self.config.server_id}' (PID: {self.pid})")
-            if self._job:
-                assigned = self._job.assign_process(self.pid)
-                if assigned:
-                    logger.debug(f"Assigned PID {self.pid} to Job Object '{self._job.name}'")
-                else:
-                    logger.warning(f"Could not assign PID {self.pid} to Job Object '{self._job.name}'")
-            return proc
+        isolated_env = build_isolated_environment(self.config.env, server_id=self.config.server_id)
 
         try:
-            with patch.object(mcp_stdio_mod, "_create_platform_compatible_process", hook_create_process):
-                async with stdio_client(params) as (read_stream, write_stream):
+            async with win32_mcp_stdio_transport(
+                command=self.config.command,
+                args=self.config.args,
+                env=isolated_env,
+                cwd=self.config.cwd,
+                job=self._job,
+            ) as (read_stream, write_stream, proc):
+                with self._lock:
+                    self.pid = proc.pid
+                    self.state = MCPServerState.INITIALIZING
+                logger.info(f"Spawned MCP server '{self.config.server_id}' (PID: {self.pid}) via Win32 suspended launcher")
+
+                async with ClientSession(read_stream, write_stream) as session:
+                    init_result = await session.initialize()
                     with self._lock:
-                        self.state = MCPServerState.INITIALIZING
+                        self._session = session
+                        self.protocol_version = str(getattr(session, "protocol_version", "2024-11-05"))
+                        if hasattr(init_result, "server_info"):
+                            sinfo = init_result.server_info
+                            self.server_info = {
+                                "name": getattr(sinfo, "name", ""),
+                                "version": getattr(sinfo, "version", "")
+                            }
+                        if hasattr(init_result, "capabilities"):
+                            caps = init_result.capabilities
+                            self.capabilities = caps.model_dump() if hasattr(caps, "model_dump") else {}
 
-                    async with ClientSession(read_stream, write_stream) as session:
-                        init_result = await session.initialize()
-                        with self._lock:
-                            self._session = session
-                            self.protocol_version = str(getattr(session, "protocol_version", "2024-11-05"))
-                            if hasattr(init_result, "server_info"):
-                                sinfo = init_result.server_info
-                                self.server_info = {
-                                    "name": getattr(sinfo, "name", ""),
-                                    "version": getattr(sinfo, "version", "")
-                                }
-                            if hasattr(init_result, "capabilities"):
-                                caps = init_result.capabilities
-                                self.capabilities = caps.model_dump() if hasattr(caps, "model_dump") else {}
+                        self.state = MCPServerState.READY
+                        logger.info(f"MCP server '{self.config.server_id}' successfully INITIALIZED and READY.")
+                        self._ready_event.set()
 
-                            self.state = MCPServerState.READY
-                            logger.info(f"MCP server '{self.config.server_id}' successfully INITIALIZED and READY.")
-                            self._ready_event.set()
-
-                        # Keep session active until stop is signaled
-                        await self._stop_event.wait()
-                        logger.debug(f"Stop signal received for MCP server '{self.config.server_id}'")
+                    # Keep session active until stop is signaled
+                    await self._stop_event.wait()
+                    logger.debug(f"Stop signal received for MCP server '{self.config.server_id}'")
 
         except BaseException as e:
             err_msg = f"MCP session error in '{self.config.server_id}': {str(e)}"

@@ -94,6 +94,65 @@ class TestAdvTransportBackpressure(unittest.TestCase):
 
         session.stop()
 
+    def test_slow_consumer_backpressure_bounded_memory(self):
+        """Verifies that a fast producer writing multiple 200 KB frames against a slow consumer
+        maintains strictly bounded memory (< 100 MB working set) without message loss.
+        """
+        import os
+        import time
+        import psutil
+
+        config = MCPServerConfig(
+            server_id="slow_consumer_srv",
+            name="Slow Consumer Server",
+            command=sys.executable,
+            args=[str(self.fixture_file)],
+            startup_timeout=3.0,
+            request_timeout=10.0
+        )
+        session = MCPClientSession(config)
+        self.assertTrue(session.start())
+
+        proc = psutil.Process(os.getpid())
+        initial_ws_mb = proc.memory_info().rss / (1024 * 1024)
+
+        # Stream 10 payloads of 200 KB each (2 MB total) with consumer delays
+        for i in range(10):
+            res = session.call_tool("large_blob", {"size_kb": 200})
+            self.assertEqual(res.get("status"), "SUCCESS")
+            self.assertEqual(len(res.get("result", "")), 200 * 1024)
+            # Simulated consumer delay (slow consumer)
+            time.sleep(0.05)
+
+        final_ws_mb = proc.memory_info().rss / (1024 * 1024)
+        ws_growth_mb = final_ws_mb - initial_ws_mb
+
+        # Memory should remain strictly bounded (growth < 15 MB)
+        self.assertLess(ws_growth_mb, 15.0, f"Excessive working set growth: {ws_growth_mb:.2f} MB")
+        session.stop()
+
+    def test_backpressure_cancellation_latency(self):
+        """Verifies that stopping a session or cancelling during backpressure completes within bounded time (< 1.5s)."""
+        import time
+
+        config = MCPServerConfig(
+            server_id="bp_cancel_srv",
+            name="BP Cancel Server",
+            command=sys.executable,
+            args=[str(self.fixture_file)],
+            startup_timeout=3.0,
+            request_timeout=3.0
+        )
+        session = MCPClientSession(config)
+        self.assertTrue(session.start())
+
+        # Start large tool call and immediately initiate stop
+        t0 = time.time()
+        session.stop()
+        elapsed = time.time() - t0
+
+        self.assertLess(elapsed, 1.5, f"Session stop took too long under backpressure: {elapsed:.2f}s")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,16 +75,19 @@ async def win32_mcp_stdio_transport(
         file_stream = FileReadStream(proc.stdout)
         text_stream = TextReceiveStream(file_stream, encoding=encoding, errors=encoding_error_handler)
         buffer = ""
+        buffer_byte_count = 0
         try:
             async with read_stream_writer:
                 async for chunk in text_stream:
-                    if len(buffer) + len(chunk) > MAX_MESSAGE_LINE_LENGTH_BYTES:
+                    chunk_bytes = len(chunk.encode(encoding))
+                    if buffer_byte_count + chunk_bytes > MAX_MESSAGE_LINE_LENGTH_BYTES:
                         err = ValueError(f"MCP stdout message line exceeded buffer ceiling ({MAX_MESSAGE_LINE_LENGTH_BYTES} bytes)")
                         logger.error(str(err))
                         await read_stream_writer.send(err)
                         return
                     lines = (buffer + chunk).split("\n")
                     buffer = lines.pop()
+                    buffer_byte_count = len(buffer.encode(encoding))
                     for line in lines:
                         clean_line = line.strip("\r")
                         if not clean_line.strip():

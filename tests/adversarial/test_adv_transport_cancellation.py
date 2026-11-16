@@ -93,6 +93,22 @@ class TestAdvTransportCancellation(unittest.TestCase):
         self.assertFalse(tool_thread.is_alive())
         self.assertLess(stop_duration, 3.0, "Session stop hung during in-flight tool execution")
 
+    def test_rapid_cancellation_during_startup(self):
+        """Verifies that stopping a session immediately while it is starting terminates cleanly."""
+        config = MCPServerConfig(
+            server_id="startup_cancel_srv",
+            name="Startup Cancel Server",
+            command=sys.executable,
+            args=[str(self.fixture_file)],
+            startup_timeout=5.0
+        )
+        session = MCPClientSession(config)
+        session.start()
+        # Immediate stop
+        stopped = session.stop()
+        self.assertTrue(stopped)
+        self.assertFalse(session.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,6 +80,57 @@ class TestAdvTransportEOF(unittest.TestCase):
 
         session.stop()
 
+    def test_eof_during_tool_discovery(self):
+        """Server crashes when handling tools/list."""
+        code = (
+            "import sys, json, os\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    method = req.get('method')\n"
+            "    req_id = req.get('id')\n"
+            "    if method == 'initialize':\n"
+            "        resp = {'jsonrpc': '2.0', 'id': req_id, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'srv', 'version': '1'}}}\n"
+            "        sys.stdout.write(json.dumps(resp) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "    elif method == 'tools/list':\n"
+            "        os._exit(99)\n"
+        )
+        self.fixture_file.write_text(code)
+
+        config = MCPServerConfig(
+            server_id="eof_tools_list",
+            name="EOF Tools List",
+            command=sys.executable,
+            args=[str(self.fixture_file)],
+            startup_timeout=3.0,
+            request_timeout=2.0
+        )
+        session = MCPClientSession(config)
+        self.assertTrue(session.start())
+
+        tools = session.list_tools()
+        self.assertEqual(len(tools), 0)
+        session.stop()
+
+    def test_no_worker_threads_leaked_after_eof(self):
+        """Verifies that abrupt server EOF does not leak background worker threads."""
+        import threading
+        self.fixture_file.write_text("import sys; sys.exit(1)")
+
+        config = MCPServerConfig(
+            server_id="eof_threads",
+            name="EOF Threads",
+            command=sys.executable,
+            args=[str(self.fixture_file)],
+            startup_timeout=1.0
+        )
+        session = MCPClientSession(config)
+        session.start()
+        session.stop()
+
+        mcp_threads = [t.name for t in threading.enumerate() if t.name.startswith("MCP-")]
+        self.assertEqual(len(mcp_threads), 0, f"Leaked worker threads: {mcp_threads}")
+
 
 if __name__ == "__main__":
     unittest.main()

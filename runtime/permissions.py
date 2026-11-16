@@ -51,17 +51,46 @@ class AuthorizationResult:
     user_consent_required: bool = False
 
 
+def _validate_and_normalize_canonical_data(obj: Any) -> Any:
+    """Recursively validates JSON primitives, strictly enforces string dict keys,
+    normalizes -0.0 to 0.0 per RFC 8785, and rejects non-JSON / non-finite values."""
+    if obj is None or isinstance(obj, (str, bool, int)):
+        return obj
+    elif isinstance(obj, float):
+        import math
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"Non-finite float value {obj} is rejected in canonical arguments")
+        # Normalize -0.0 to 0.0 per RFC 8785 section 3.2.2.3
+        if obj == 0.0:
+            return 0.0
+        return obj
+    elif isinstance(obj, dict):
+        normalized_dict = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                raise TypeError(f"All dictionary keys must be strings, got {type(k).__name__}: {k!r}")
+            normalized_dict[k] = _validate_and_normalize_canonical_data(v)
+        return normalized_dict
+    elif isinstance(obj, (list, tuple)):
+        return [_validate_and_normalize_canonical_data(item) for item in obj]
+    else:
+        raise TypeError(f"Unsupported non-JSON data type in tool arguments: {type(obj).__name__}")
+
+
 def canonicalize_arguments(args: Optional[Dict[str, Any]]) -> str:
     """Produces a deterministic, canonical JSON representation of tool arguments.
     Sorts all dictionary keys recursively and enforces strict comma/colon separators.
-    Rejects non-finite floating point numbers (NaN, Infinity).
+    Validates that all dictionary keys are strings and normalizes -0.0 to 0.0 per RFC 8785.
+    Rejects non-finite floating point numbers (NaN, Infinity) and non-JSON objects.
     """
     if args is None:
         return "{}"
     if not isinstance(args, dict):
         raise ValueError(f"Tool arguments must be a dictionary, got {type(args).__name__}")
+
+    normalized = _validate_and_normalize_canonical_data(args)
     return json.dumps(
-        args,
+        normalized,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -142,9 +171,12 @@ class PermissionBoundary:
         token: str,
         action_name: str,
         context: Optional[Dict[str, Any]] = None,
-        conversation_id: str = ""
+        conversation_id: str = "",
+        expected_tier: Optional[AuthorityLevel] = None
     ) -> bool:
-        """Atomically verifies and consumes a single-use consent token with strict argument validation."""
+        """Atomically verifies and consumes a single-use consent token with strict argument and tier validation."""
+        import hmac
+
         if not token or not isinstance(token, str):
             return False
 
@@ -171,14 +203,34 @@ class PermissionBoundary:
             )
             return False
 
-        # Strict canonical argument validation
+        # Validate against registered policy and expected permission tier
+        current_policy = self._policies.get(action_name)
+        if not current_policy:
+            logger.warning(f"No policy registered for action '{action_name}'. Failing closed.")
+            return False
+
+        if current_policy.required_level != consent.tier:
+            logger.warning(
+                f"Consent token tier mismatch for '{action_name}': "
+                f"token tier is {consent.tier.name}, but current policy required level is {current_policy.required_level.name}."
+            )
+            return False
+
+        if expected_tier is not None and (consent.tier != expected_tier or current_policy.required_level != expected_tier):
+            logger.warning(
+                f"Consent token expected tier mismatch for '{action_name}': "
+                f"expected {expected_tier.name}, got consent tier {consent.tier.name}."
+            )
+            return False
+
+        # Strict canonical argument validation with constant-time comparison
         try:
             presented_arg_hash = compute_argument_hash(context)
         except Exception as e:
             logger.warning(f"Failed to canonicalize presented arguments for '{action_name}': {e}")
             return False
 
-        if consent.argument_hash != presented_arg_hash:
+        if not hmac.compare_digest(consent.argument_hash, presented_arg_hash):
             logger.warning(
                 f"Consent token argument mismatch for '{action_name}': "
                 f"approved args digest ({consent.argument_hash[:8]}...) did not match "
@@ -192,7 +244,7 @@ class PermissionBoundary:
             )
             return False
 
-        logger.info(f"Verified and consumed valid consent token for '{action_name}'.")
+        logger.info(f"Verified and consumed valid consent token for '{action_name}' [tier={consent.tier.name}].")
         return True
 
     def _register_default_policies(self) -> None:

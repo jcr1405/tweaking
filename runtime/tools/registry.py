@@ -8,7 +8,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Callable
 
-from runtime.permissions import PermissionBoundary, PermissionTier, ActionPolicy, AuthorizationResult
+from runtime.permissions import (
+    PermissionBoundary,
+    PermissionTier,
+    ActionPolicy,
+    AuthorizationResult,
+    canonicalize_arguments,
+)
 
 logger = logging.getLogger("presence.tools.registry")
 
@@ -89,7 +95,17 @@ class ToolRegistry:
             logger.warning(err_msg)
             return {"status": "ERROR", "error": err_msg}
 
-        # Ensure policy is registered in boundary
+        # Step 1: Validate incoming arguments and produce an isolated immutable snapshot
+        # Guarantees immunity against TOCTOU and concurrent external argument mutations.
+        try:
+            canonical_json = canonicalize_arguments(args)
+            authorized_args = json.loads(canonical_json)
+        except Exception as e:
+            err_msg = f"Argument validation and canonicalization failed for '{tool_id}': {e}"
+            logger.warning(err_msg)
+            return {"status": "ERROR", "error": err_msg}
+
+        # Step 2: Ensure policy is registered in boundary
         if tool.tool_id not in permission_boundary._policies:
             permission_boundary.register_policy(ActionPolicy(
                 action_name=tool.tool_id,
@@ -98,20 +114,21 @@ class ToolRegistry:
                 requires_explicit_consent=(tool.authority_tier == PermissionTier.L3_PROTECTED)
             ))
 
-        # Validate explicit user consent token if provided (cryptographic single-use verification)
+        # Step 3: Validate explicit user consent token if provided (cryptographic single-use verification)
         granted_consent = False
         if consent_token:
             granted_consent = permission_boundary.verify_consent_token(
                 token=consent_token,
                 action_name=tool.tool_id,
-                context=args,
-                conversation_id=conversation_id
+                context=authorized_args,
+                conversation_id=conversation_id,
+                expected_tier=tool.authority_tier
             )
 
-        # Authorize against the 4-tier permission boundary
+        # Step 4: Authorize against the 4-tier permission boundary using authorized snapshot
         auth: AuthorizationResult = permission_boundary.check_permission(
             action_name=tool.tool_id,
-            context=args,
+            context=authorized_args,
             granted_consent=granted_consent
         )
 
@@ -125,9 +142,9 @@ class ToolRegistry:
                 "allowed": False
             }
 
-        # Execute registered handler safely
+        # Step 5: Execute registered handler strictly with authorized_args snapshot
         try:
-            result = tool.handler(args)
+            result = tool.handler(authorized_args)
             return {"status": "SUCCESS", "result": result}
         except Exception as e:
             err_msg = f"Error during tool execution: {str(e)}"

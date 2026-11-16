@@ -122,7 +122,7 @@ Presence makes **no false promises of guaranteed cryptographic memory zeroizatio
 
 ---
 
-## 5. Authenticated Named Pipe IPC Security Architecture (P2C-19)
+## 5. Authenticated Named Pipe IPC Security Architecture (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)
 
 Communication between the Presence Runtime and developer extensions (such as the VS Code context provider) operates over a dedicated local Windows Named Pipe. A pipe name alone is **not** an authentication mechanism. Presence enforces four distinct security layers:
 
@@ -130,64 +130,105 @@ Communication between the Presence Runtime and developer extensions (such as the
 +---------------------------------------------------------------------------------------------------+
 |                            FOUR-TIER IPC SECURITY ARCHITECTURE                                    |
 +---------------------------------------------------------------------------------------------------+
-  1. Transport Access Control (DACL with Logon SID & User SID; PIPE_REJECT_REMOTE_CLIENTS)
+  1. Transport Access Control (Logon SID DACL, First-Instance Flag, Remote Client Rejection)
       │
       ▼
-  2. OS Peer Verification (PID, Token, User SID, Approved Executable Image, FILETIME Ticks)
+  2. OS Peer Verification (PID, Token Logon SID, Approved Executable Image, FILETIME Ticks)
       │
       ▼
-  3. Cryptographic Mutual Authentication (Single-Use Pairing, HMAC-SHA256 Challenge-Response)
+  3. Cryptographic Mutual Authentication (Single-Use Pairing, Bound Transcript HMAC-SHA256)
       │
       ▼
-  4. Message Authorization & Framing (4-byte length prefix, 64 KB ceiling, Allowlisted Operations)
+  4. Message Authorization & Framing (4-byte length prefix, 64 KB ceiling, Canonical vscode.* allowlist)
 ```
 
-### 5.1 Layer 1: Transport Access Control & Server Hardening
-- **Server Pipe Construction**: `CreateNamedPipeW` with `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`) and `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`).
-- **Explicit Security Descriptor**:
-  - Restricts access strictly to the **Current User SID** and **Current Logon SID** (`(A;;GRGW;;;<LogonSID>)`).
-  - Restricting by Logon SID ensures that processes running in other terminal services sessions, secondary logons, or background services cannot connect to the pipe even if running under the same user account.
-- **Pipe Naming**: `\\.\pipe\presence-vscode-<logon-sid-hash>-<session-id>`. Contains no secrets; scoped to session.
+### 5.1 Layer 1: Transport Access Control & Server Hardening (P2C-21, P2C-22)
+- **Server Pipe Construction**:
+  `CreateNamedPipeW` parameters are strictly separated to prevent security misconfigurations:
+  * **`dwOpenMode`**:
+    `PIPE_ACCESS_DUPLEX (0x00000003) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x00080000) | FILE_FLAG_OVERLAPPED (0x40000000)`
+    - `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`) guarantees that Presence creates the pipe object. If a squatting pipe already exists, `CreateNamedPipeW` fails immediately with `ERROR_ACCESS_DENIED`. The server fails closed and alerts the user.
+  * **`dwPipeMode`**:
+    `PIPE_TYPE_BYTE (0x00000000) | PIPE_READMODE_BYTE (0x00000000) | PIPE_REJECT_REMOTE_CLIENTS (0x00000008) | PIPE_WAIT (0x00000000)`
+    - `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`) strictly blocks network and SMB clients at the Windows NPFS kernel driver level.
+    - Byte mode (`PIPE_TYPE_BYTE`) provides streaming compatibility with Node.js / libuv in VS Code, avoiding Windows message-mode edge cases.
+- **Hardened DACL (P2C-21)**:
+  * Security Descriptor string: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`
+  * Owner (Presence server) receives `GENERIC_ALL` (`GA` / `0x1F01FF`), granting creation, administration, and full control.
+  * Client (VS Code) receives strictly specific data-exchange rights under its **Logon SID**:
+    `0x0012019B` (`FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE`).
+  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from the client ACE. The client cannot create additional server instances of the pipe.
+  * **Cross-Session Isolation**: The broad User SID grant (`(A;;GRGW;;;<UserSID>)`) is **completely removed**. Processes running under the same user account in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) possess different Logon SIDs and are rejected by Windows kernel security (`STATUS_ACCESS_DENIED`).
+  * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES` prevents handle inheritance by child processes.
+- **Pipe Naming**: `\\.\pipe\presence-vscode-<username>-<logon_session_id>`. Scoped to the interactive logon session.
 
 ### 5.2 Layer 2: OS Peer Identity Verification
-Upon connection (`ConnectNamedPipe`), the server verifies:
+Upon client connection (`ConnectNamedPipe`), the server verifies:
 1. `GetNamedPipeClientProcessId(hPipe, &client_pid)`: Retrieves caller PID.
 2. `GetNamedPipeClientSessionId(hPipe, &client_session)`: Verifies caller belongs to the interactive session.
 3. Open process with `PROCESS_QUERY_LIMITED_INFORMATION`:
-   - `QueryFullProcessImageNameW`: Verifies executable image matches approved VS Code installation path (`Code.exe` / `Code - Insiders.exe`).
-   - `GetProcessTimes`: Captures `process_creation_filetime_ticks` to bind session to process instance.
+   - `QueryFullProcessImageNameW`: Verifies executable image matches approved VS Code installation path (`Code.exe` / `Code - Insiders.exe`). Note: Documented as defense-in-depth, as unprivileged same-user processes can rename binaries.
+   - `GetProcessTimes`: Captures `client_creation_filetime_ticks: int` to bind session to the exact process instance, preventing PID recycling attacks.
 4. `OpenProcessToken` with `TOKEN_QUERY`:
-   - Verifies User SID matches Presence server User SID.
-   - Verifies Logon SID matches expected interactive logon session.
+   - Calls `GetTokenInformation(TokenGroups)` to verify the client's token contains the server's Logon SID.
 5. Impersonation Check: Uses `ImpersonateNamedPipeClient` to inspect the token, then **always** calls `RevertToSelf` in a guaranteed `try/finally` block. Never executes Presence operations while impersonating.
 
-### 5.3 Layer 3: Application Authentication via HMAC Challenge-Response
-Because multiple VS Code processes or same-user tools can run simultaneously, OS checks are supplemented with cryptographic mutual authentication:
-1. **One-Time Pairing**:
-   - Initiated via explicit user command (`presence vscode-pair`).
-   - Generates single-use 256-bit pairing secret (`token_urlsafe(32)`), TTL = 5 minutes.
-   - Extension stores secret in VS Code `context.secrets` (`SecretStorage`).
-   - Presence stores secret in protected user configuration.
-2. **Handshake Protocol**:
-   - Presence sends `SERVER_HELLO` with fresh 256-bit `server_nonce`.
-   - Extension replies with `CLIENT_AUTH` with fresh 256-bit `client_nonce` and `HMAC-SHA256(shared_secret, "CLIENT_AUTH" || server_nonce || client_nonce || client_pid || creation_ticks)`.
-   - Presence validates HMAC via `secrets.compare_digest()`. On match, Presence replies with `SERVER_AUTH` containing `HMAC-SHA256(shared_secret, "SERVER_AUTH" || server_nonce || client_nonce)`.
-   - Extension validates server HMAC. Session is bound to `(client_pid, process_creation_filetime_ticks, nonces)`. Replayed handshakes fail closed immediately.
+### 5.3 Layer 3: Application Authentication via Bound Transcript HMAC (P2C-26)
+Because multiple processes or same-user tools can run simultaneously, OS checks are supplemented with cryptographic mutual authentication binding the entire connection transcript:
+1. **Short-Lived Pairing Flow**:
+   - Initiated via explicit user command: `presence vscode-pair`.
+   - Generates single-use 256-bit pairing secret (`secrets.token_hex(32)`), TTL = 5 minutes.
+   - User enters secret directly into VS Code extension UI; extension stores secret in VS Code `context.secrets` (`SecretStorage`, backed by Windows DPAPI / Credential Manager).
+   - In Presence, stored in user-scoped DPAPI credential store.
+   - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
+2. **Transcript-Bound Mutual Authentication**:
+   - Server issues fresh 32-byte cryptographically secure random `server_nonce` (hex).
+   - Client generates 32-byte `client_nonce` (hex).
+   - Both parties construct the canonical transcript string:
+     `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
+   - Client sends `AUTH_RESPONSE`:
+     `client_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_CLIENT_AUTH_V1|" + T.encode())`
+   - Server verifies `client_mac` using constant-time comparison (`secrets.compare_digest`).
+   - Server replies with `AUTH_CONFIRM`:
+     `server_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SERVER_AUTH_V1|" + T.encode())`
+   - Client independently verifies `server_mac` using `secrets.compare_digest`.
+   - Ephemeral session key is derived:
+     `session_key = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`
+   - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
+   - Handshake timeout is 500 ms. Maximum 1 active client connection (`nMaxInstances = 1`). Disconnects immediately on failure.
 
-### 5.4 Layer 4: Message Authorization & Bounded Framing
-- **Framing**: Byte pipe with 4-byte big-endian length prefix (`uint32`), max payload 64 KB (reject oversized frames before memory allocation).
-- **Strict Operation Allowlist**:
-  * `provider.hello`
-  * `provider.get_workspace_metadata` (workspace root path, open folder names, trust state)
-  * `provider.get_active_editor_metadata` (relative file path, language ID; NO file content)
-  * `provider.status`
-  * `provider.shutdown`
-- **Prohibitions**: The extension **cannot** execute shell commands, invoke Presence tools, issue consent tokens, or alter permission boundaries.
+### 5.4 Layer 4: Message Authorization & Bounded Framing (P2C-27)
+- **Framing**: Byte stream with 4-byte big-endian length prefix (`uint32`), max payload 64 KB (`65536` bytes). Payloads exceeding 64 KB cause immediate connection termination before memory allocation.
+- **Canonical Operation Allowlist (`vscode.*`)**:
+  * `vscode.ping`: Health check and keep-alive (`{"status": "ok", "timestamp_utc": str}`).
+  * `vscode.get_active_workspace`: Returns active workspace metadata (`{"workspace_name": str, "workspace_folders": list[str], "is_trusted": bool}`).
+  * `vscode.get_active_editor_metadata`: Returns active document metadata (`{"file_path": str, "relative_path": str, "language_id": str, "is_dirty": bool}`).
+  * `vscode.get_open_documents`: Returns list of open editor file paths (`{"open_documents": list[str]}`).
+- **Strict Invariants**:
+  * `provider.shutdown` is **REMOVED AND PROHIBITED**. Neither party can shut down or mutate the other via this channel.
+  * Read-only metadata only: **Zero file contents**, zero code execution, zero keystrokes.
+  * Ambient context is **never** sent to VS Code (unidirectional flow: VS Code metadata $\to$ Presence context).
+  * No consent tokens can be minted or altered by the extension.
+  * Unauthorized methods return JSON-RPC error `-32601` (`Method not found`).
 
 ### 5.5 Threat Boundary & Same-User Malware Reality
-The architecture establishes clear defense boundaries:
-- **Protected Against**: Network attackers, other logged-on users, terminal server cross-session eavesdropping, non-paired applications, spoofed client PIDs, replay attacks.
-- **Same-User Threat Model Reality**: Windows security boundaries are per-user/integrity-level. A malicious process executing arbitrary code under the exact same user account with identical integrity level could theoretically attempt memory injection or read local DPAPI-protected user files. Presence mitigates this by combining Logon SID DACLs, executable path verification, process creation tick binding, and SecretStorage pairing, but explicitly acknowledges that user-level compromise cannot be completely defended against by user-mode IPC alone.
+The architecture establishes distinct, layered defense boundaries:
+- **Layer Distinction**:
+  1. *Pipe Naming*: Identifies the endpoint; provides zero authentication.
+  2. *DACL Restrictions*: Kernel-level access control restricting who can open the pipe.
+  3. *Logon SID Isolation*: Restricts access across interactive logon sessions under the same account.
+  4. *`PIPE_REJECT_REMOTE_CLIENTS`*: Blocks all network and SMB traversal.
+  5. *Application-Level HMAC*: Proves possession of the paired secret and binds connection transcript.
+- **Same-User Threat Model Reality**:
+  On Windows, processes running under the same user account and same integrity level (Medium) have broad capabilities against each other (e.g. `OpenProcess(PROCESS_VM_READ)`).
+  The 4-layer architecture successfully defends against:
+  - Network and SMB traversal
+  - Other user accounts on the machine
+  - Cross-session elevation and background service tampering
+  - Pipe squatting and impersonation
+  - Un-paired local processes guessing pipe names
+  - Replay and session splicing attacks
+  However, it does **not** claim to withstand arbitrary malware executing with full debug privileges inside the user's interactive session with direct memory injection capabilities. This boundary is acknowledged honestly.
 
 ---
 
@@ -220,9 +261,15 @@ The architecture establishes clear defense boundaries:
 - **Attack Surface**: An external MCP tool is invoked while sensitive contextual data is in memory.
 - **Mitigation**: Ambient environmental context is completely stripped from tool dispatch payloads. MCP servers receive only explicit, user-authorized parameters.
 
-### 6.5 Threat T-05: Unauthorized IPC Access & Pipe Hijacking (P2C-19)
+### 6.5 Threat T-05: Unauthorized IPC Access & Pipe Hijacking (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)
 - **Attack Surface**: Malicious local tool connects to Presence named pipe to inject false context or extract desktop metadata.
-- **Mitigation**: `FILE_FLAG_FIRST_PIPE_INSTANCE` prevents hijacking; Logon SID DACL blocks other sessions; client PID, token SID, executable image path, and HMAC-SHA256 challenge-response block unauthorized processes.
+- **Mitigation**:
+  1. `FILE_FLAG_FIRST_PIPE_INSTANCE` (0x00080000) prevents pipe pre-creation and squatting; fails closed immediately.
+  2. `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) enforces kernel-level remote client rejection.
+  3. Logon SID DACL strictly withholds `FILE_CREATE_PIPE_INSTANCE` (0x0004) from the client; removal of broad User SID grant blocks other logon sessions.
+  4. OS peer checks verify client PID, executable image path (`Code.exe`), creation ticks, and token Logon SID.
+  5. Cryptographic mutual challenge-response authenticates the complete handshake transcript (version, endpoint, PIDs, ticks, nonces) via HMAC-SHA256, verified with `secrets.compare_digest`.
+  6. Strict `vscode.*` allowlist restricts actions to read-only metadata; `provider.shutdown` is prohibited.
 
 ---
 

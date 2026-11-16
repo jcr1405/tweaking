@@ -71,18 +71,30 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
 - **Objective**: Connect `ContextManager` to real Windows desktop events via native Win32 APIs.
 - **Scope**:
   - Implement `ForegroundWindowSource` using `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`.
-  - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `DispatchMessageW`).
-  - Implement hook callback reentrancy guards (`_in_callback` flag, non-blocking callback queuing to `collections.deque(maxlen=50)`, and thread-safe handoff via `loop.call_soon_threadsafe()`).
+  - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
+  - Implement hook callback reentrancy guard (`_in_callback` flag) and compact event queuing (`collections.deque(maxlen=50)`).
+  - Implement **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
+    * Synchronized state flag: `_notification_pending: bool = False`.
+    * Native callback appends to raw queue (overflow drops oldest event; increments `events_dropped`).
+    * If `_notification_pending` is True: increments `events_coalesced`; does not schedule another notification.
+    * If `_notification_pending` is False: sets `_notification_pending = True`; increments `notification_callbacks_scheduled`; dispatches via `loop.call_soon_threadsafe()`.
+    * Consumer drains all queued items under lock, processes latest foreground state, and resets `_notification_pending = False`.
+    * Guaranteed invariant: `pending_notification_count <= 1` at all times.
+  - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped`, `queue_high_water_mark`, `notification_callbacks_scheduled`, `notification_callbacks_executed`, `max_event_processing_delay`, `pending_notification_count`.
   - Retrieve top-level window caption via `GetWindowTextW` (User32 cached caption; no synthetic timeouts).
   - Construct composite `WindowIdentity` (`HWND`, `PID`, `process_creation_filetime_ticks: int`, `window_class`).
   - Implement 150 ms event debouncing and duplicate suppression.
-  - Guarantee clean unhooking via `UnhookWinEvent`, `WM_QUIT`, and thread join.
+  - Implement **Owner-Controlled Shutdown (P2C-25)**:
+    * Hook unhooking (`UnhookWinEvent`) is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
+    * Runtime thread joins hook thread with 1.0s timeout.
+    * If `thread.is_alive()` after timeout, report `HookShutdownTimeoutError` (do not claim clean termination).
 - **Files Created**:
   - `runtime/context/sources/__init__.py`
   - `runtime/context/sources/foreground_window.py`
   - `tests/test_win32_foreground_source.py`
   - `tests/adversarial/test_adv_context_debouncing.py`
   - `tests/adversarial/test_adv_hook_reentrancy.py`
+  - `tests/adversarial/test_adv_hook_backpressure.py`
 - **Files Modified**:
   - `runtime/platform_win32.py` (Add User32/Kernel32 window inspection bindings)
   - `runtime/context/manager.py` (Register `ForegroundWindowSource`)
@@ -91,7 +103,7 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - Thread Count: Exactly 1 background OS thread (`WinEventHookThread`).
   - Idle CPU: Design Target < 0.05%; Acceptance Ceiling < 0.20% (event-driven kernel wait in `GetMessageW`).
   - Working Set Overhead: Design Target < 3.5 MB; Acceptance Ceiling < 8.0 MB.
-- **Exit Criteria**: Hook reliably detects window switches; callback reentrancy verified; debouncing verified; clean teardown leaves zero dangling hooks and zero leaked handles.
+- **Exit Criteria**: Hook reliably detects window switches; callback reentrancy verified; debouncing verified; single-pending-notification verified under burst; clean teardown leaves zero dangling hooks and zero leaked handles.
 
 ---
 
@@ -169,13 +181,32 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
 ### 2.6 Subphase 2C.5: Application-Specific Context Provider Foundation
 - **Objective**: Add deep context extraction for developer applications (VS Code and Windows Terminal) via authenticated local IPC.
 - **Scope**:
-  - **VS Code Integration (Option C — P1-01, P2C-19)**:
+  - **VS Code Integration (Option C — P1-01, P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)**:
     * 4-Layer Authenticated Named Pipe Architecture:
-      - **Layer 1 (Transport Access Control)**: Pipe name `\\.\pipe\presence-vscode-<user>-<session>`. Created with `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) and `FILE_FLAG_FIRST_PIPE_INSTANCE` (0x00080000). Explicit DACL granting `GENERIC_READ | GENERIC_WRITE` only to the user's Logon SID and User SID. Rejects remote network clients and other desktop sessions.
-      - **Layer 2 (Peer Process Identity Verification)**: Server calls `GetNamedPipeClientProcessId()`, validates client executable path is authentic `Code.exe` via `QueryFullProcessImageNameW()`, checks process creation ticks, and inspects client token to verify identical Logon SID.
-      - **Layer 3 (Application Pairing & Mutual Authentication)**: One-time user-initiated pairing secret generated by Presence, passed via command-line activation or user copy-paste, stored in VS Code's `SecretStorage` (DPAPI/Credential Manager). Mutual HMAC-SHA256 challenge-response authentication with 32-byte cryptographic nonces; verified using constant-time comparison (`secrets.compare_digest`). Negotiates ephemeral session token.
-      - **Layer 4 (Framing, Payload Bounds & Operation Authorization)**: 4-byte length-prefixed framing with a hard 64 KB payload ceiling. Strict JSON-RPC schema allowlist for read-only metadata: `get_active_workspace`, `get_open_documents`, `get_active_language_id`. Arbitrary file reading, code execution, and telemetry modification are strictly prohibited.
-    * Threat model: Documents defense-in-depth boundary against same-user unprivileged malware.
+      - **Layer 1 (Transport Access Control & Parameter Separation)**:
+        * Pipe name `\\.\pipe\presence-vscode-<username>-<logon_session_id>`.
+        * Parameter placement: `dwOpenMode` (`PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED` = `0x40080003`); `dwPipeMode` (`PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS | PIPE_WAIT` = `0x00000008`).
+        * Hardened DACL: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`. The broad User SID grant is **completely removed** to eliminate cross-session access expansion.
+        * Withholding instance authority: `FILE_CREATE_PIPE_INSTANCE` (`0x0004`) is **strictly withheld** from the client ACE (`0x0012019B`).
+        * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES`.
+        * Fails closed with `ERROR_ACCESS_DENIED` if pipe squatting is detected.
+      - **Layer 2 (Peer Process Identity Verification)**:
+        * Server queries `GetNamedPipeClientProcessId()`.
+        * Verifies executable image path via `QueryFullProcessImageNameW()` against approved VS Code installation paths (`Code.exe` / `Code - Insiders.exe`).
+        * Queries `GetProcessTimes()` to obtain `client_creation_filetime_ticks: int` against PID recycling.
+        * Queries `OpenProcessToken()` and `GetTokenInformation(TokenGroups)` to assert identical client Logon SID.
+      - **Layer 3 (Pairing & Bound Transcript Mutual Authentication)**:
+        * Short-lived user pairing command: `presence vscode-pair` (256-bit secret, 5-minute TTL, single-use).
+        * Stored in VS Code `SecretStorage` (DPAPI) and Presence user vault. Never passed in CLI args, env vars, history, or logs.
+        * Complete transcript binding:
+          `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
+        * Mutual challenge-response with domain separation labels (`PRESENCE_VSCODE_CLIENT_AUTH_V1` and `PRESENCE_VSCODE_SERVER_AUTH_V1`) and constant-time `secrets.compare_digest`.
+        * Ephemeral session key derived: `HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`.
+      - **Layer 4 (Framing, Payload Bounds & Canonical Operation Allowlist)**:
+        * 4-byte big-endian length prefix (`>I`), hard 64 KB (`65536` bytes) payload ceiling.
+        * Canonical operation allowlist: `vscode.ping`, `vscode.get_active_workspace`, `vscode.get_active_editor_metadata`, `vscode.get_open_documents`.
+        * `provider.shutdown` is **strictly prohibited**. Read-only metadata only (zero file contents, zero code execution).
+    * Threat model: Honestly articulates same-user medium-integrity memory access boundaries.
     * Option A (window title heuristic) used strictly as fallback when extension is absent or unauthenticated.
   - **Windows Terminal Integration (Option C — P1-02)**:
     * Acknowledge that Windows Terminal provides no public external query API for cwd.
@@ -191,9 +222,9 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - `tests/adversarial/test_adv_ipc_authentication.py`
 - **Files Modified**:
   - `runtime/context/manager.py` (Query active application provider)
-- **Security Gate**: Named pipe authentication verified across all 4 layers; client identity validated; replay attacks rejected; provider timeouts prevent thread blocking.
+- **Security Gate**: Named pipe authentication verified across all 4 layers; client identity validated; transcript replayed attacks rejected; provider timeouts prevent thread blocking.
 - **Resource Budget**: Provider execution capped at 500 ms; provider crashes isolated without killing ContextManager.
-- **Exit Criteria**: VS Code workspace path accurately resolved; terminal cwd extracted; graceful fallback on crash; unauthenticated pipe clients rejected.
+- **Exit Criteria**: VS Code workspace path accurately resolved; terminal cwd extracted; graceful fallback on crash; unauthenticated or cross-session pipe clients rejected.
 
 ---
 
@@ -232,31 +263,34 @@ runtime/
 
 ---
 
-## 4. Resource Measurement Methodology & Acceptance Budgets (P1-03, P2C-20)
+## 4. Resource Measurement Methodology & Acceptance Budgets (P1-03, P2C-20, P2C-24)
 
-To ensure scientific rigor, Phase 2C performance is evaluated using standardized measurement scripts (`tests/diagnose_resource_telemetry.py`) executing six discrete test experiments:
+To ensure scientific rigor, Phase 2C performance is evaluated using standardized measurement scripts (`tests/diagnose_resource_telemetry.py`) executing seven discrete test experiments:
 
-### 4.1 Standardized Experiments (A through F)
+### 4.1 Standardized Experiments (A through G)
 
 1. **Experiment A — Cold Baseline**: Record idle working set, private bytes, thread count, and kernel handle count of the Python process prior to initializing `ContextManager`.
 2. **Experiment B — Hook Initialization**: Start `ForegroundWindowSource`. Assert that exactly one OS thread (`WinEventHookThread`) is added via Toolhelp32 snapshot. Record handle allocation delta.
 3. **Experiment C — Steady-State Idle (300s Soak)**: Monitor the runtime for 300 seconds without user window switches. Verify that the hook thread sleeps inside `GetMessageW` (kernel wait). Record CPU time, wakeups, and working set drift.
 4. **Experiment D — Foreground Switch Burst**: Programmatically trigger 50 rapid foreground window focus changes across 2 seconds. Verify that the reentrancy guard (`_in_callback`) prevents recursion, the bounded queue (`deque(maxlen=50)`) absorbs events without growth, and 150 ms debouncing coalesces duplicate events.
 5. **Experiment E — Sustained Interaction (10-Minute Soak)**: Generate 500 window transition events over 10 minutes. Monitor working set and handle counts. Verify garbage collection stability and ensure working set plateaus without linear growth.
-6. **Experiment F — Teardown & Cleanliness**: Stop `ContextManager`. Assert that `UnhookWinEvent` is called, `WM_QUIT` terminates `GetMessageW`, the hook thread joins within 1.0 second, and net handle and thread counts return exactly to cold baseline.
+6. **Experiment F — Teardown & Cleanliness**: Stop `ContextManager`. Assert that `UnhookWinEvent` is called strictly by `WinEventHookThread`, `WM_QUIT` terminates `GetMessageW`, the hook thread joins within 1.0 second, and net handle and thread counts return exactly to cold baseline. If join times out, report failure state.
+7. **Experiment G — Stalled Consumer Backpressure Stress Test (P2C-24)**: Artificially delay the asyncio consumer by 1.0 second during a burst of 500 synthetic window events. Assert that `_raw_event_queue` length does not exceed 50, `pending_notification_count <= 1` is strictly maintained, `events_dropped` and `events_coalesced` account for all suppressed events, and the asyncio queue is not flooded.
 
-### 4.2 Resource Budgets: Design Target vs Acceptance Ceiling
+### 4.2 Resource Budgets: Design Target, Acceptance Ceiling & Evidence Classification
 
-Phase 2C distinguishes between optimal **Design Targets** and binding **Acceptance Ceilings**:
+Phase 2C rigorously distinguishes between **Design Targets**, binding **Acceptance Ceilings**, and actual **Measured Results**:
 
-| Resource Metric | Measurement Condition | Design Target | Acceptance Ceiling | Enforcement Action |
-|---|---|---|---|---|
-| **Idle CPU Utilization** | Steady-state idle (Exp C) | < 0.05% | < 0.20% | Profiling audit if ceiling breached |
-| **Hook Worker Threads** | Active runtime (Exp B, C) | Exactly 1 thread | Exactly 1 thread | Hard test failure if > 1 |
-| **Working Set Overhead** | Active runtime vs baseline | < 3.5 MB | < 8.0 MB | Memory leak audit if ceiling breached |
-| **Burst CPU Utilization** | 50 events / 2s burst (Exp D) | < 1.0% | < 3.0% | Debounce tuning if ceiling breached |
-| **Net Kernel Handle Leaks** | Post-teardown vs baseline (Exp F) | Exactly 0 | Exactly 0 | Hard test failure if > 0 |
-| **Capability Dispatch Latency**| Class A observation calls | < 15 ms | < 50 ms | Query optimization if ceiling breached |
+| Resource Metric | Measurement Condition | Design Target | Acceptance Ceiling | Evidence Classification | Enforcement Action |
+|---|---|---|---|---|---|
+| **Idle CPU Utilization** | Steady-state idle (Exp C) | < 0.05% | < 0.20% | DESIGN ONLY | Profiling audit if ceiling breached |
+| **Hook Worker Threads** | Active runtime (Exp B, C) | Exactly 1 thread | Exactly 1 thread | DESIGN ONLY | Hard test failure if > 1 |
+| **Working Set Overhead** | Active runtime vs baseline | < 3.5 MB | < 8.0 MB | DESIGN ONLY | Memory leak audit if ceiling breached |
+| **Burst CPU Utilization** | 50 events / 2s burst (Exp D) | < 1.0% | < 3.0% | DESIGN ONLY | Debounce tuning if ceiling breached |
+| **Pending Notification Count** | Any runtime state (Exp D, G) | ≤ 1 callback | Exactly 1 callback | DESIGN ONLY | Hard test failure if > 1 |
+| **Raw Event Queue Size** | Any runtime state (Exp D, G) | ≤ 50 items | Exactly 50 items | DESIGN ONLY | Hard test failure if > 50 |
+| **Net Kernel Handle Leaks** | Post-teardown vs baseline (Exp F) | Exactly 0 | Exactly 0 | DESIGN ONLY | Hard test failure if > 0 |
+| **Capability Dispatch Latency**| Class A observation calls | < 15 ms | < 50 ms | DESIGN ONLY | Query optimization if ceiling breached |
 
 ---
 

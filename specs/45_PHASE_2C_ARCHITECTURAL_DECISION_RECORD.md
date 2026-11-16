@@ -156,74 +156,104 @@ In accordance with Presence engineering principles, mature open-source projects,
 
 ---
 
-### ADR-2C-11: Canonical FILETIME Process Identity Representation (P2C-18)
+### ADR-2C-11: Canonical FILETIME Process Identity Representation & Exact Conversion (P2C-18, P2C-23)
 - **Status**: **APPROVED**
-- **Context**: Previous specifications stored process creation time as `process_creation_time_ns` and converted to Python `datetime.datetime`. This introduced ambiguity regarding unit definitions (nanoseconds vs 100ns ticks), epoch offsets (1601 vs 1970), leap seconds, and sub-microsecond precision truncation (Python `datetime` has microsecond resolution, losing 100ns precision).
+- **Context**: Previous specifications stored process creation time as `process_creation_time_ns` and converted to Python `datetime.datetime` using floating-point division (`unix_ns / 1_000_000_000.0`), reintroducing float rounding error and sub-microsecond ambiguity.
 - **Decision**:
   1. Store process creation time canonically as `process_creation_filetime_ticks: int` (raw 64-bit unsigned integer count of 100-nanosecond intervals since January 1, 1601 UTC).
-  2. Implement canonical conversion formulas:
-     - `filetime_to_ticks(ft) = (ft.dwHighDateTime << 32) | ft.dwLowDateTime`
-     - `filetime_ticks_to_unix_ns(ticks) = (ticks - 116444736000000000) * 100`
-     - `filetime_ticks_to_unix_seconds(ticks) = (ticks - 116444736000000000) / 10_000_000.0`
-  3. Window identity and TOCTOU validation compare raw 64-bit integer ticks directly (`current_ticks == expected_ticks`), eliminating all float and datetime rounding artifacts.
-  4. Conversion to Python `datetime` is used strictly for user-facing telemetry and display, with explicit documentation that sub-microsecond ticks are truncated.
+  2. Implement canonical integer conversion formulas:
+     - `FILETIME_UNIX_EPOCH_OFFSET_TICKS = 116444736000000000`
+     - `unix_100ns = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS`
+     - `unix_ns = unix_100ns * 100`
+     - `unix_seconds_numerator = unix_100ns`, `unix_seconds_denominator = 10_000_000`
+  3. Window identity and TOCTOU validation compare raw 64-bit integer ticks directly (`current_ticks == expected_ticks`), eliminating all float and datetime rounding artifacts. Zero float conversion occurs in the canonical identity path.
+  4. Human-readable `datetime.datetime` conversion uses pure integer arithmetic:
+     ```python
+     def filetime_ticks_to_utc_datetime(ticks: int) -> datetime:
+         unix_100ns = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS
+         unix_microseconds = unix_100ns // 10
+         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+         return epoch + timedelta(microseconds=unix_microseconds)
+     ```
+  5. Document that integer floor division `// 10` drops sub-microsecond precision (`unix_100ns % 10`, 0-900 ns) because Python `datetime` has microsecond resolution. The raw tick value is never altered.
 - **Alternatives Considered**:
   - *Floating-point Unix timestamps*: 64-bit IEEE 754 floats have 53 bits of mantissa, losing precision for nanosecond timestamps. Rejected.
-  - *Python `datetime.datetime`*: Microsecond precision (6 decimal places) discards the lowest digit of 100ns FILETIME, causing false TOCTOU mismatch on rapid process reuse. Rejected.
-  - *Arbitrary `process_creation_time_ns`*: Ambiguous whether offset from 1601 or 1970, and multiplying ticks by 100 introduces unnecessary integer scaling. Rejected.
-- **Technical Justification**: Windows kernel natively represents time via `FILETIME` struct (`dwLowDateTime`, `dwHighDateTime`). Combining into a Python arbitrary-precision integer preserves the exact 64-bit kernel value with zero truncation.
+  - *Python `datetime.datetime` for TOCTOU validation*: Microsecond precision discards the lowest digit of 100ns FILETIME, causing false TOCTOU mismatch on rapid process reuse. Rejected.
+  - *Float-based datetime constructor (`datetime.fromtimestamp(unix_seconds)`)*: Reintroduces IEEE 754 floating-point rounding errors. Rejected.
+- **Technical Justification**: Combining low and high DWORDs into a Python integer preserves the exact 64-bit kernel value. Using integer arithmetic for timedelta avoids float precision loss.
 - **Security Consequences**: Prevents PID-recycling TOCTOU vulnerabilities by ensuring byte-for-byte exact equality checks between the observed window and the activated window.
 - **Resource Consequences**: Zero memory or computational overhead; integer comparison in Python is a single-cycle operation.
-- **Limitations**: Displaying creation time to humans requires epoch offset arithmetic and sub-microsecond truncation to fit ISO 8601 microseconds.
+- **Limitations**: Human-readable display truncates sub-microsecond precision (0-900 ns).
 - **Microsoft References**:
   - [FILETIME structure (minwinbase.h)](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
   - [GetProcessTimes function (processthreadsapi.h)](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
 
 ---
 
-### ADR-2C-12: Authenticated Local Named Pipe IPC for Developer Context (P2C-19)
+### ADR-2C-12: Authenticated Local Named Pipe IPC for Developer Context (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)
 - **Status**: **APPROVED**
-- **Context**: Developer tools like VS Code hold valuable context (active workspace, open files, language). Unauthenticated or ambient IPC introduces severe security risks: pipe squatting, cross-session snooping, unauthorized model steering, and data harvesting.
+- **Context**: Developer tools like VS Code hold valuable context (active workspace, open files, language). Unauthenticated or ambient IPC introduces severe security risks: pipe squatting, cross-session access expansion, unauthorized model steering, and data harvesting.
 - **Decision**: Implement a 4-layer authenticated named pipe IPC architecture for VS Code context extraction:
-  1. **Transport Access Control**: Pipe name `\\.\pipe\presence-vscode-<user>-<session>`. Created with `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) and `FILE_FLAG_FIRST_PIPE_INSTANCE` (0x00080000). Explicit DACL granting access solely to caller's Logon SID and User SID (`(A;;GRGW;;;<LogonSID>)(A;;GRGW;;;<UserSID>)`).
-  2. **Peer Process Identity Verification**: Server obtains client PID via `GetNamedPipeClientProcessId()`, validates executable path via `QueryFullProcessImageNameW()` against `Code.exe`, and verifies client process token Logon SID matches server Logon SID.
-  3. **Application Pairing & Mutual Challenge-Response**: User initiates one-time pairing secret stored in VS Code's `SecretStorage` (DPAPI). Mutual HMAC-SHA256 challenge-response exchange with 32-byte nonces; constant-time digest verification (`secrets.compare_digest`). Negotiates ephemeral session token.
-  4. **Framing, Payload Bounds & Operation Authorization**: 4-byte big-endian length prefix; 64 KB hard max payload ceiling. Strict JSON-RPC schema allowlist restricted to read-only metadata (`get_active_workspace`, `get_open_documents`, `get_active_language_id`).
+  1. **Transport Access Control & Parameter Separation (P2C-21, P2C-22)**:
+     - Pipe name `\\.\pipe\presence-vscode-<username>-<logon_session_id>`.
+     - `dwOpenMode`: `PIPE_ACCESS_DUPLEX (0x3) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x80000) | FILE_FLAG_OVERLAPPED (0x40000000)`. Fails closed if squatted.
+     - `dwPipeMode`: `PIPE_TYPE_BYTE (0x0) | PIPE_READMODE_BYTE (0x0) | PIPE_REJECT_REMOTE_CLIENTS (0x8) | PIPE_WAIT (0x0)`. Rejects remote clients at NPFS kernel level.
+     - Hardened DACL: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`. Broad User SID grant is completely removed, eliminating cross-session access expansion.
+     - Client rights: `0x0012019B` strictly withholds `FILE_CREATE_PIPE_INSTANCE` (`0x0004`).
+     - `bInheritHandle = FALSE` prevents child process inheritance.
+  2. **Peer Process Identity Verification**: Server obtains client PID via `GetNamedPipeClientProcessId()`, validates executable path via `QueryFullProcessImageNameW()` against `Code.exe`, captures process creation ticks via `GetProcessTimes()`, and asserts client token Logon SID matches server Logon SID.
+  3. **Application Pairing & Bound Transcript Mutual Authentication (P2C-26)**:
+     - User-mediated pairing command: `presence vscode-pair` (256-bit secret, 5-minute TTL, single-use, DPAPI-protected, no secrets in CLI flags/env vars/logs).
+     - Full transcript binding: `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`.
+     - Domain separation labels: `PRESENCE_VSCODE_CLIENT_AUTH_V1` and `PRESENCE_VSCODE_SERVER_AUTH_V1`. Constant-time digest verification (`secrets.compare_digest`). Ephemeral session key derived.
+  4. **Framing, Payload Bounds & Canonical Operation Allowlist (P2C-27)**:
+     - 4-byte big-endian length prefix; 64 KB hard max payload ceiling.
+     - Canonical operation allowlist: `vscode.ping`, `vscode.get_active_workspace`, `vscode.get_active_editor_metadata`, `vscode.get_open_documents`.
+     - `provider.shutdown` is strictly prohibited. Read-only metadata only (zero file contents, zero code execution).
 - **Alternatives Considered**:
-  - *Local HTTP Server (localhost)*: Any process on the machine (and scripts in browsers via DNS rebinding / CORS misconfigurations) can reach localhost ports. Requires port discovery. Rejected.
-  - *Windows Shared Memory / MMF*: Lacks built-in synchronization, framing, and granular OS-level client PID verification. Rejected.
-  - *Unauthenticated Named Pipe*: Vulnerable to pipe squatting, impersonation, and any medium-integrity process reading/writing without proof of VS Code identity. Rejected.
-- **Technical Justification**: Named pipes are the standard Windows IPC mechanism. Win32 provides rich security descriptors, client PID query APIs, and kernel-enforced remote rejection. Pairing secret + HMAC provides cryptographic proof of VS Code extension identity.
-- **Security Consequences**: Blocks unauthorized processes from querying workspace metadata or spoofing context into Presence. Mitigates pipe squatting, replay attacks, and cross-session access.
+  - *Local HTTP Server (localhost)*: Vulnerable to DNS rebinding and cross-site scripting port scanning. Rejected.
+  - *Broad User SID DACL*: Permits cross-session access to other logon sessions of the same account. Rejected.
+  - *Granting GENERIC_WRITE to client*: Grants `FILE_CREATE_PIPE_INSTANCE` (0x0004). Rejected.
+  - *Unbound Nonce Challenge*: Fails to bind process identities and endpoint to authentication proof. Rejected.
+- **Technical Justification**: Combining Logon SID DACL with specific rights withholding 0x0004, first-instance flag, remote rejection, process identity verification, and transcript-bound HMAC provides maximum practical defense-in-depth on Windows.
+- **Security Consequences**: Prevents cross-session eavesdropping, pipe squatting, replay attacks, and instance creation attacks.
 - **Resource Consequences**: Ephemeral IPC connection queried only on window focus change. Timeout capped at 500 ms. Minimal RAM footprint (< 50 KB).
-- **Limitations**: Does not prevent a root/admin process or a dedicated process memory debugger running as the same user from inspecting memory. This boundary is explicitly documented.
+- **Limitations**: Medium-integrity processes executing within the same interactive user session could theoretically inspect process memory. This boundary is explicitly documented.
 - **Microsoft References**:
   - [Named Pipe Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
+  - [CreateNamedPipeW function (namedpipeapi.h)](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)
   - [GetNamedPipeClientProcessId function (winbase.h)](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid)
-  - [PIPE_REJECT_REMOTE_CLIENTS flag (winbase.h)](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea)
 
 ---
 
-### ADR-2C-13: SetWinEventHook Resource and Callback Lifecycle Model (P2C-20)
+### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Bounded Dispatch Model (P2C-20, P2C-24, P2C-25)
 - **Status**: **APPROVED**
-- **Context**: Previous specifications made unrealistic absolute claims of "0.0% CPU" and "zero wakeups" for `SetWinEventHook`. In reality, out-of-context hooks require a message loop (`GetMessageW`), and foreground window changes trigger callbacks that execute on the hook thread. Furthermore, hook callbacks can be reentered if they invoke User32 APIs that yield the message queue.
+- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, hook destruction ownership must belong strictly to the installing thread.
 - **Decision**:
-  1. Acknowledge realistic resource model: Steady-state idle achieves near-zero CPU (< 0.05% design target, < 0.20% ceiling) because `GetMessageW` enters a kernel wait state. However, OS scheduler ticks, system events, and window switches cause wakeups.
-  2. Implement dedicated `WinEventHookThread` with clean message pump (`GetMessageW` / `DispatchMessageW`).
-  3. Implement reentrancy guard: Use `_in_callback` flag in `WinEventHook` handler. Hook callback is strictly minimal and non-blocking: copies `(hwnd, event, idObject, idChild)` to a thread-safe bounded queue (`collections.deque(maxlen=50)`), and notifies asyncio loop via `loop.call_soon_threadsafe()`. Heavy Win32 inspection (`GetWindowTextW`, PID query) is performed on worker threads outside the hook callback.
-  4. Implement clean teardown sequence: `UnhookWinEvent(hHook)` -> `PostThreadMessageW(thread_id, WM_QUIT, 0, 0)` -> `thread.join(timeout=1.0)`.
-  5. Establish six standardized verification experiments (A through F) with explicit Design Targets vs Acceptance Ceilings.
+  1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
+  2. Implement reentrancy guard (`_in_callback` flag) and bounded raw queue (`collections.deque(maxlen=50)`).
+  3. Implement **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
+     - Atomic/synchronized flag `_notification_pending: bool`.
+     - Callback appends event to raw deque (overflow drops oldest event; increments `events_dropped`).
+     - If `_notification_pending` is True, increments `events_coalesced` and suppresses additional scheduling.
+     - If `_notification_pending` is False, sets flag to True and schedules `loop.call_soon_threadsafe(state.on_event)`.
+     - Consumer drains raw deque, processes latest event, and resets flag to False.
+     - Invariant: `pending_notification_count <= 1` at all times.
+  4. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
+     - `UnhookWinEvent(self._hHook)` is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
+     - Runtime thread joins hook thread with 1.0s timeout. If alive after timeout, reports `HookShutdownTimeoutError` (do not claim clean termination).
+  5. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
-  - *Polling loop (`while True: GetForegroundWindow(); sleep(0.25)`)*: Constant CPU wakeups (4 wakeups/sec), battery drain, timer resolution jitter. Rejected.
-  - *In-context hook (DLL injection)*: High security risk, flagged by antivirus, incompatible with sandboxed processes. Rejected.
-  - *Heavy synchronous processing inside hook callback*: Delays OS message pump, causes UI stuttering across the desktop, risks callback reentrancy deadlocks. Rejected.
-- **Technical Justification**: Separating minimal event queuing in the hook callback from asynchronous debounced processing on worker threads prevents UI degradation while maintaining reactive event-driven awareness.
-- **Security Consequences**: Non-blocking minimal callback prevents denial-of-service on the desktop window manager. Out-of-context hook avoids foreign process memory injection.
-- **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped by bounded deque. Clean teardown guarantees zero thread or handle leaks.
-- **Limitations**: If a user switches windows faster than 50 events/2s, the bounded deque drops oldest unconsumed raw events (graceful degradation via debouncing).
+  - *Scheduling notification on every event*: Floods asyncio event loop with unbounded callbacks during Alt-Tab storms. Rejected.
+  - *Unhooking from runtime thread*: Violates Win32 thread affinity for hooks, introducing race conditions. Rejected.
+  - *Assuming thread termination on timeout*: Masked hung thread bugs. Rejected.
+- **Technical Justification**: Separating minimal event queuing from single-pending-notification asyncio handoff guarantees an end-to-end bounded dispatch pipeline ($O(1)$ memory).
+- **Security Consequences**: Prevents UI stuttering and eliminates denial-of-service vectors against the desktop message loop.
+- **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 50 in deque and exactly 1 pending notification callback.
+- **Limitations**: Dropping oldest events during Alt-Tab bursts prioritizes the latest foreground window state.
 - **Microsoft References**:
   - [SetWinEventHook function (winuser.h)](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook)
-  - [WinEventProc callback function (winuser.h)](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nc-winuser-wineventproc)
+  - [Guarding Against Reentrancy in Hook Functions](https://learn.microsoft.com/en-us/windows/win32/winauto/guarding-against-reentrancy-in-hook-functions)
   - [UnhookWinEvent function (winuser.h)](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-unhookwinevent)
 
 ---
@@ -242,12 +272,12 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-08** | Clipboard | Defer clipboard access from default Phase 2C | Eliminates credential harvesting; realistic memory zeroization |
 | **ADR-2C-09** | Terminology | Job Objects = Process Lifecycle Containment | Accurate Windows OS security taxonomy (not a security sandbox) |
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
-| **ADR-2C-11** | Process Identity | Canonical `process_creation_filetime_ticks: int` | 64-bit 100ns ticks; zero sub-microsecond truncation; raw integer TOCTOU check |
-| **ADR-2C-12** | Local IPC | 4-layer authenticated named pipe for VS Code | Logon SID DACL; PID verification; HMAC challenge-response; 64 KB framing |
-| **ADR-2C-13** | Hook Model | Message loop, reentrancy guard & realistic resource model | Kernel wait in `GetMessageW`; non-blocking deque; standardized Experiments A-F |
+| **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
+| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & bound transcript HMAC | Logon SID only; withhold 0x0004; parameter separation; transcript HMAC; canonical allowlist |
+| **ADR-2C-13** | Hook Model | Coalesced WinEvent dispatch & owner teardown | Single-pending notification (`<= 1`); owner unhooks; timeout failure reporting |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specification 46 and Specification 47.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specification 46, Specification 47, and Specification 48.

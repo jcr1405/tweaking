@@ -135,7 +135,7 @@ Phase 2C defines an initial set of 6 foundational capabilities. Capabilities req
   - Presence implements `desktop.activate_window` as a **best-effort operation**:
     1. Validate `IsWindow(hwnd)`.
     2. Validate that current PID matches `expected_process_id`.
-    3. Validate process creation time via `GetProcessTimes` if `expected_creation_filetime_ticks` is provided. The `creation_time` FILETIME struct from `GetProcessTimes` is converted to a 64-bit unsigned integer and compared directly with raw integer equality against `expected_creation_filetime_ticks`.
+    3. Validate process creation time via `GetProcessTimes` if `expected_creation_filetime_ticks` is provided. The `creation_time` FILETIME struct from `GetProcessTimes` is converted to a 64-bit unsigned integer and compared directly with raw integer equality against `expected_creation_filetime_ticks`. Zero float conversion occurs, and `datetime` is never used for TOCTOU validation.
     4. Call `SetForegroundWindow(hwnd)`.
     5. If `SetForegroundWindow` returns `FALSE` (foreground activation denied by Windows policy), call `FlashWindowEx()` to alert the user on the taskbar, and return status `ACTIVATION_QUEUED_OR_FLASHED`.
 - **Return Value**:
@@ -357,4 +357,4 @@ Specification 43 is ready for implementation only when all following criteria ar
 3. **Shell vs Job Object Disambiguation**: Clear architectural distinction between shell association opening and Job-contained process execution.
 4. **Best-Effort Foreground Activation**: `desktop.activate_window` adheres to Windows foreground policy and implements composite TOCTOU verification without `AttachThreadInput`.
 5. **Worker Thread Boundedness & Classification**: All capability functions are strictly Class A or Class C; no Class D blocking calls exist. Shell requests are correctly classified as Class C asynchronous best-effort requests with caller-owned handle management.
-6. **Canonical Process Identity**: Window identity and TOCTOU validation use canonical 64-bit FILETIME ticks (`expected_creation_filetime_ticks`).
+6. **Canonical Process Identity**: Window identity and TOCTOU validation use canonical 64-bit FILETIME ticks (`expected_creation_filetime_ticks`) compared strictly via raw 64-bit integer equality without float conversions or datetime approximations.

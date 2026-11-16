@@ -126,36 +126,43 @@ All native Win32 APIs used for context acquisition are documented with official 
 
 #### `GetProcessTimes` & Canonical FILETIME Ticks
 - **Documentation**: [Microsoft Learn — GetProcessTimes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes), [FILETIME Structure](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
-- **FILETIME Definition**: A 64-bit integer representing the number of **100-nanosecond intervals** (ticks) since January 1, 1601 (UTC).
+- **FILETIME Definition**: A 64-bit unsigned integer representing the number of **100-nanosecond intervals** (ticks) since January 1, 1601 (UTC).
 - **Canonical Representation**: To prevent precision loss and unit confusion, Presence stores and compares process creation timestamps strictly as a 64-bit integer tick count: `process_creation_filetime_ticks: int`.
 
 ```python
-# Number of 100-nanosecond intervals between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC
+from datetime import datetime, timedelta, timezone
+
+# Number of 100-nanosecond intervals between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC:
+# (369 years * 365 days + 89 leap days) * 86,400 s/day * 10,000,000 ticks/s
 FILETIME_UNIX_EPOCH_OFFSET_TICKS = 116444736000000000
 
 def filetime_to_ticks(high: int, low: int) -> int:
     """Constructs canonical 64-bit integer tick count from FILETIME high/low DWORDs."""
     return (high << 32) | low
 
-def filetime_ticks_to_unix_ns(ticks: int) -> int:
-    """Converts FILETIME 100-ns ticks to Unix epoch nanoseconds."""
-    return (ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS) * 100
-
-def filetime_ticks_to_unix_seconds(ticks: int) -> float:
-    """Converts FILETIME 100-ns ticks to Unix epoch seconds (floating-point)."""
-    return (ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS) / 10_000_000.0
+def filetime_ticks_to_unix_parts(ticks: int) -> tuple[int, int, int]:
+    """Exact integer conversion relations without floating-point arithmetic.
+    Returns: (unix_100ns, unix_ns, unix_seconds_integer)
+    """
+    unix_100ns = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS
+    unix_ns = unix_100ns * 100
+    unix_seconds_integer = unix_100ns // 10_000_000
+    return unix_100ns, unix_ns, unix_seconds_integer
 
 def filetime_ticks_to_utc_datetime(ticks: int) -> datetime:
-    """Converts FILETIME ticks to UTC datetime.
-    Note: Python datetime has microsecond precision; sub-microsecond precision is truncated.
+    """Converts FILETIME ticks to UTC datetime using pure integer arithmetic.
+    Note: Python datetime has microsecond resolution (1,000 ns); sub-microsecond
+    precision (unix_100ns % 10, representing 0-900 ns) is truncated.
+    The raw ticks: int is never altered.
     """
-    unix_ticks = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS
-    whole_microseconds = unix_ticks // 10
-    return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=whole_microseconds)
+    unix_100ns = ticks - FILETIME_UNIX_EPOCH_OFFSET_TICKS
+    unix_microseconds = unix_100ns // 10
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return epoch + timedelta(microseconds=unix_microseconds)
 ```
 
 > [!IMPORTANT]
-> **Identity Comparison Invariant**: Canonical process identity validation **must always compare raw integer ticks** (`live_ticks == expected_ticks`). Conversions to float seconds or `datetime` are strictly for logging and human presentation.
+> **Identity Comparison Invariant**: Canonical process identity validation **must always compare raw integer ticks** (`live_ticks == expected_ticks`). Window TOCTOU validation never uses `datetime`. Conversions to `datetime` are strictly for human display and audit logs, with documented microsecond truncation. Float timestamps are strictly prohibited from the canonical identity path.
 
 ---
 
@@ -214,23 +221,38 @@ While composite verification drastically minimizes handle-recycling risks, no us
 
 ---
 
-## 6. SetWinEventHook Lifecycle, Reentrancy & Resource Model (P2C-20)
+## 6. SetWinEventHook Lifecycle, Reentrancy & Bounded Dispatch Model (P2C-20, P2C-24, P2C-25)
 
-### 6.1 Accurate WinEvent Architecture
+### 6.1 Accurate WinEvent Architecture & Message Loop
 - **Documentation**: [Microsoft Learn — SetWinEventHook](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook), [Guarding Against Reentrancy in Hook Functions](https://learn.microsoft.com/en-us/windows/win32/winauto/guarding-against-reentrancy-in-hook-functions)
 - **Mechanism**: Windows delivers out-of-context accessibility events to the registered hook callback through the User32 WinEvent infrastructure.
 - **Thread & Message Queue Ownership**:
-  - The thread that calls `SetWinEventHook` **must run a Win32 message pump** (`GetMessageW` / `DispatchMessageW`).
-  - Events are queued sequentially to this thread's message queue.
+  - The thread that calls `SetWinEventHook` **must host a dedicated Win32 message pump** (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
+  - Events are dispatched sequentially to this thread's message queue.
   - Dedicated background OS thread: `WinEventHookThread`.
-  - When idle, `GetMessageW` sleeps inside a kernel wait; CPU usage is minimal, but Presence does not make misleading claims of "0.0% CPU" or "zero timer wakeups".
+  - When idle, `GetMessageW` enters a Windows kernel wait state (`Executive/UserRequest`). CPU usage drops to near-zero (< 0.05% design target, < 0.20% acceptance ceiling), but Presence does not make misleading claims of "0.0% CPU" or "zero timer wakeups".
 
-### 6.2 Minimal, Non-Blocking, Reentrancy-Safe Callback
-Out-of-context hook callbacks can be reentered if message pumping occurs during execution. To guarantee safety and prevent thread stalls:
-1. **Zero Expensive Work in Callback**: The callback does **NOT** query window text, inspect process images, allocate heavy structures, make COM calls, or perform disk I/O.
-2. **Reentrancy Guard**: An atomic reentrancy counter immediately drops nested callback invocations.
-3. **Bounded Thread-Safe Queue**: The callback places a compact tuple `(hwnd, time.monotonic())` into a thread-safe bounded queue (`collections.deque(maxlen=50)`).
-4. **Handoff to AsyncIO**: Dispatches notification to the main asyncio loop via `loop.call_soon_threadsafe(manager._on_hook_event)`.
+### 6.2 Minimal, Non-Blocking, Reentrancy-Safe Callback & Coalesced Dispatch
+Out-of-context hook callbacks can be reentered if message pumping occurs during execution. Furthermore, scheduling an event-loop notification for every raw callback would create an **unbounded asyncio notification queue** if the asyncio loop is temporarily delayed.
+
+To establish a strictly bounded, reentrancy-safe pipeline:
+1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate memory dynamically, make COM calls, or perform disk I/O.
+2. **Reentrancy Guard**: An atomic reentrancy flag (`_in_callback`) drops nested callback invocations immediately.
+3. **Bounded Raw Queue**: The callback places a compact tuple `(hwnd, time.monotonic())` into a thread-safe bounded queue (`collections.deque(maxlen=50)`). Overflow drops the oldest event to preserve the latest foreground state.
+4. **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
+   - Maintains an atomic/synchronized state flag: `_notification_pending: bool = False`.
+   - When an event arrives:
+     * Appends to `_raw_event_queue`. If queue was full (50 items), oldest item is evicted; `events_dropped` is incremented.
+     * Checks `_notification_pending`:
+       - If `_notification_pending` is `True`: increments `events_coalesced`; does **not** schedule another callback.
+       - If `_notification_pending` is `False`: sets `_notification_pending = True`; increments `notification_callbacks_scheduled`; dispatches a single notification via `loop.call_soon_threadsafe(manager._on_hook_event)`.
+5. **AsyncIO Consumer Draining**:
+   - In `manager._on_hook_event`:
+     * Increments `notification_callbacks_executed`.
+     * Drains all queued items from `_raw_event_queue` under lock.
+     * Resets `_notification_pending = False` under lock.
+     * Takes the latest event, applies 150 ms debouncing, and triggers snapshot update.
+6. **Bounded Invariant**: `pending_notification_count <= 1` at all times. The asyncio event loop never accumulates a backlog of notification callbacks.
 
 ```python
 class WinEventCallbackState:
@@ -238,7 +260,16 @@ class WinEventCallbackState:
         self.loop = loop
         self.on_event = on_event_callback
         self.queue = deque(maxlen=max_queue)
-        self.reentrancy_lock = False
+        self.lock = threading.Lock()
+        self.in_callback = False
+        self.notification_pending = False
+        # Instrumentation counters
+        self.raw_events_received = 0
+        self.events_coalesced = 0
+        self.events_dropped = 0
+        self.queue_high_water_mark = 0
+        self.notification_callbacks_scheduled = 0
+        self.notification_callbacks_executed = 0
 
 def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventThread, dwmsEventTime):
     # Guard: only foreground events on top-level windows
@@ -246,81 +277,126 @@ def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventT
         return
         
     state = _GLOBAL_HOOK_STATE
-    if state.reentrancy_lock:
+    if state.in_callback:
         return  # Drop reentrant calls
         
-    state.reentrancy_lock = True
+    state.in_callback = True
     try:
         now_mono = time.monotonic()
-        state.queue.append((hwnd, now_mono))
-        state.loop.call_soon_threadsafe(state.on_event)
+        with state.lock:
+            state.raw_events_received += 1
+            if len(state.queue) == state.queue.maxlen:
+                state.events_dropped += 1
+            state.queue.append((hwnd, now_mono))
+            state.queue_high_water_mark = max(state.queue_high_water_mark, len(state.queue))
+            
+            if not state.notification_pending:
+                state.notification_pending = True
+                state.notification_callbacks_scheduled += 1
+                state.loop.call_soon_threadsafe(state.on_event)
+            else:
+                state.events_coalesced += 1
     finally:
-        state.reentrancy_lock = False
+        state.in_callback = False
 ```
 
-### 6.3 Clean Unhooking & Teardown Protocol
-During `ContextManager.stop()`:
-1. Calls `UnhookWinEvent(hHook)` on the hook thread.
-2. Posts `WM_QUIT` to the hook thread's message queue via `PostThreadMessageW()`.
-3. Joins `WinEventHookThread` with a 500 ms timeout.
-4. Clears all pending queue references, ensuring zero dangling callbacks or thread leaks across repeated cycles.
+### 6.3 Owner-Controlled Unhooking & Teardown Protocol (P2C-25)
+In Win32 User32 architecture, `UnhookWinEvent` must be executed by the thread that installed the hook (`WinEventHookThread`). Allowing the runtime thread to unhook directly introduces race conditions and undefined handle destruction.
+
+The teardown sequence is strictly owner-controlled:
+1. `ContextManager.stop()` requests shutdown of `ForegroundWindowSource`.
+2. `ForegroundWindowSource` sets `_stopping = True` to halt event processing.
+3. Runtime thread posts `WM_QUIT` to `WinEventHookThread` via `PostThreadMessageW(thread_id, WM_QUIT, 0, 0)`.
+4. `WinEventHookThread`'s `GetMessageW` returns 0 on `WM_QUIT`.
+5. `WinEventHookThread` calls `UnhookWinEvent(self._hHook)` for its own hook, clears `self._hHook = None`, and exits its thread run method.
+6. The runtime thread waits for the hook thread via `thread.join(timeout=1.0)`.
+7. **Timeout Reality & Verification**:
+   - If `thread.is_alive()` is `False`: Clean termination is verified. Pending queue references are cleared.
+   - If `thread.is_alive()` is `True`: **DO NOT claim successful cleanup!** Report `HookShutdownTimeoutError` and log diagnostic evidence (thread TID, handle count).
 
 ---
 
-## 7. Authenticated Named Pipe Endpoint Architecture (P2C-19)
+## 7. Authenticated Named Pipe Endpoint Architecture (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)
 
 For Subphase 2C.5, Presence defines an authenticated local IPC channel to receive workspace metadata from developer tools (VS Code):
 
 ```
 [Presence Runtime Server]
-    │ (CreateNamedPipeW with explicit Logon SID DACL)
-    │ (PIPE_REJECT_REMOTE_CLIENTS | FILE_FLAG_FIRST_PIPE_INSTANCE)
+    │ (CreateNamedPipeW with Logon SID DACL, First-Instance Flag)
+    │ (dwOpenMode: 0x40080003, dwPipeMode: 0x00000008)
     ▼
-[Named Pipe: \\.\pipe\presence-vscode-<logon-hash>-<session>]
+[Named Pipe: \\.\pipe\presence-vscode-<username>-<logon_session_id>]
     ▲
     │ (ConnectNamedPipe)
-    │ 1. OS Client Verification (PID, Token, User SID, Executable Image)
-    │ 2. Cryptographic Mutual Challenge-Response (HMAC-SHA256, Nonces)
-    │ 3. Strict Framed JSON Message Protocol (Allowlisted Operations)
+    │ 1. OS Client Verification (PID, Path to Code.exe, Creation Ticks, Logon SID)
+    │ 2. Bound Cryptographic Mutual Challenge-Response (HMAC-SHA256, Nonces, Transcript)
+    │ 3. Strict 4-Byte Framed JSON Protocol (Allowlisted Read-Only Operations)
 [VS Code Extension Client]
 ```
 
-### 7.1 Transport Security & Server Hardening
-- **Pipe Naming**: `\\.\pipe\presence-vscode-<logon-sid-hash>-<session-id>`. Contains no secrets; scoped to user session.
-- **DACL Restriction**: Explicit Security Descriptor granting access strictly to:
-  * Current User SID (`(A;;GRGW;;;<UserSID>)`)
-  * Current Logon SID (`(A;;GRGW;;;<LogonSID>)`), preventing cross-session or service access.
-- **Flags**:
-  * `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`): Prevents pipe pre-creation / hijacking attacks.
-  * `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`): Strictly rejects network/SMB connections.
+### 7.1 Transport Security, DACL Hardening & Parameter Placement (P2C-21, P2C-22)
+- **Pipe Naming**: `\\.\pipe\presence-vscode-<username>-<logon_session_id>`. Scoped to the interactive logon session.
+- **Hardened DACL (P2C-21)**:
+  * Security Descriptor string: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`
+  * Owner (Presence server) receives `GENERIC_ALL` (`GA` / `0x1F01FF`), granting creation, administration, and full control.
+  * Connected client (VS Code) receives strictly specific data-exchange rights under its **Logon SID**:
+    `0x0012019B` (`FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE`).
+  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from the client ACE. The client cannot create additional server instances of the pipe.
+  * **Cross-Session Isolation**: The broad User SID grant (`(A;;GRGW;;;<UserSID>)`) is **completely removed**. Processes running under the same user account in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) possess different Logon SIDs and are rejected by Windows kernel security (`STATUS_ACCESS_DENIED`).
+  * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES` prevents handle inheritance by child processes.
+- **Accurate `CreateNamedPipeW` Parameter Placement (P2C-22)**:
+  * `dwOpenMode`:
+    `PIPE_ACCESS_DUPLEX (0x00000003) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x00080000) | FILE_FLAG_OVERLAPPED (0x40000000)`
+    - `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`) guarantees that Presence creates the pipe. If a squatting pipe already exists, `CreateNamedPipeW` fails immediately with `ERROR_ACCESS_DENIED`. The server fails closed.
+  * `dwPipeMode`:
+    `PIPE_TYPE_BYTE (0x00000000) | PIPE_READMODE_BYTE (0x00000000) | PIPE_REJECT_REMOTE_CLIENTS (0x00000008) | PIPE_WAIT (0x00000000)`
+    - `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`) strictly blocks SMB/network clients at the NPFS kernel driver level.
+    - Byte mode (`PIPE_TYPE_BYTE`) provides robust cross-platform streaming compatibility with Node.js / libuv, avoiding message-mode edge cases.
 
-### 7.2 OS Peer Verification & Mutual Cryptographic Authentication
-1. **OS Identity Verification**:
+### 7.2 OS Peer Verification & Transcript-Bound Mutual Authentication (P2C-26)
+1. **OS Peer Identity Verification**:
    - `GetNamedPipeClientProcessId(hPipe, &client_pid)`
    - `GetNamedPipeClientSessionId(hPipe, &client_session)`
-   - Inspect client process via `OpenProcess` + `QueryFullProcessImageNameW`: verifies image matches approved `Code.exe`.
-   - Inspect process creation ticks via `GetProcessTimes`.
-   - Inspect client token via `OpenProcessToken`: verifies User SID and Logon SID match Presence server.
-2. **One-Time Pairing**:
-   - Explicit user-initiated command (`presence vscode-pair`).
-   - Generates single-use 256-bit pairing secret (`token_urlsafe(32)`), TTL = 5 minutes.
-   - Extension stores secret in VS Code `context.secrets` (`SecretStorage`).
-   - Presence stores secret in user-scoped protected store.
-3. **Mutual Challenge-Response**:
-   - Presence issues fresh 256-bit `server_nonce`.
-   - Extension replies with `client_nonce` and `HMAC-SHA256(shared_secret, "CLIENT_AUTH" || server_nonce || client_nonce || client_pid || creation_ticks)`.
-   - Presence validates HMAC via `secrets.compare_digest()`, then returns `HMAC-SHA256(shared_secret, "SERVER_AUTH" || server_nonce || client_nonce)`.
-   - Connection is bound to `(client_pid, process_creation_filetime_ticks, nonces)`.
+   - `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, client_pid)`
+   - `QueryFullProcessImageNameW`: verifies image path matches authentic `Code.exe` (or `Code - Insiders.exe`) under approved installation paths (`%LOCALAPPDATA%\Programs\Microsoft VS Code` or `%PROGRAMFILES%\Microsoft VS Code`).
+   - `GetProcessTimes`: captures `client_creation_filetime_ticks: int` to guard against PID recycling.
+   - `OpenProcessToken` + `GetTokenInformation(TokenGroups)`: asserts client token contains server's Logon SID.
+2. **Short-Lived Pairing Flow**:
+   - Explicit user-mediated command: `presence vscode-pair`.
+   - Generates a 256-bit pairing secret (`secrets.token_hex(32)`), TTL = 5 minutes, single-use.
+   - Secret is entered directly by the user into the VS Code extension UI; stored in VS Code `SecretStorage` (backed by Windows DPAPI / Credential Manager).
+   - In Presence, stored in user-scoped DPAPI vault.
+   - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
+3. **Bound Mutual HMAC-SHA256 Challenge-Response**:
+   - Server sends `AUTH_CHALLENGE`: 32-byte cryptographically secure random `server_nonce` (hex).
+   - Client generates 32-byte `client_nonce` (hex).
+   - **Transcript Authentication**: Both parties construct the canonical transcript string:
+     `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
+   - Client sends `AUTH_RESPONSE`:
+     `client_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_CLIENT_AUTH_V1|" + T.encode())`
+   - Server verifies `client_mac` using constant-time comparison (`secrets.compare_digest`).
+   - Server returns `AUTH_CONFIRM`:
+     `server_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SERVER_AUTH_V1|" + T.encode())`
+   - Client independently verifies `server_mac` using `secrets.compare_digest`.
+   - Ephemeral session key is derived:
+     `session_key = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`
+   - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
+   - Maximum 1 active client connection (`nMaxInstances = 1`). Handshake timeout 500 ms; disconnects immediately on verification failure.
 
-### 7.3 Message Framing & Operation Allowlist
-- **Framing**: Byte pipe with 4-byte big-endian length prefix (`uint32`), max frame 64 KB.
-- **Strict Operation Allowlist**:
-  * `provider.hello`
-  * `provider.get_workspace_metadata` (workspace root path, open folder names, trust state)
-  * `provider.get_active_editor_metadata` (relative file path, language ID; NO file content)
-  * `provider.status`
-  * `provider.shutdown`
-- **Same-User Threat Boundary**: Documented clearly that DACL + Logon SID + Process Identity + HMAC protects against other users, remote attacks, non-paired applications, and cross-session snooping. It does not protect against malware executing arbitrary code inside the same user security context with full access to user memory.
+### 7.3 Message Framing & Canonical Operation Allowlist (P2C-27)
+- **Framing**: Byte stream with 4-byte big-endian unsigned integer length prefix (`>I`), max frame 64 KB (`65536` bytes). Payloads exceeding 64 KB cause immediate connection termination.
+- **Canonical Operation Allowlist (`vscode.*`)**:
+  * `vscode.ping`: Health check and keep-alive (`{"status": "ok", "timestamp_utc": str}`).
+  * `vscode.get_active_workspace`: Returns active workspace metadata (`{"workspace_name": str, "workspace_folders": list[str], "is_trusted": bool}`).
+  * `vscode.get_active_editor_metadata`: Returns active document metadata (`{"file_path": str, "relative_path": str, "language_id": str, "is_dirty": bool}`).
+  * `vscode.get_open_documents`: Returns list of open editor file paths (`{"open_documents": list[str]}`).
+- **Strict Invariants**:
+  * `provider.shutdown` is **REMOVED AND PROHIBITED**. Neither party can shut down or mutate the other via this channel.
+  * Read-only metadata only: **Zero file contents**, zero code execution, zero keystrokes.
+  * Ambient context is **never** sent to VS Code (unidirectional flow: VS Code metadata $\to$ Presence context).
+  * No consent tokens can be minted or altered by the extension.
+- **Same-User Threat Boundary**:
+  Logon SID DACL + Image Verification + Creation Ticks + Transcript HMAC prevents network attackers, other Windows users, cross-session processes, pipe squatting, and un-paired local scripts. It does not defend against arbitrary malware executing inside the same user security context that has direct access to process memory (`OpenProcess(PROCESS_VM_READ)`). This boundary is explicitly acknowledged.
 
 ---
 
@@ -343,8 +419,8 @@ Resource values are explicit **Design Targets & Acceptance Ceilings**, to be emp
 ## 9. Architectural Verification & Acceptance Criteria
 
 Specification 41 is ready for implementation only when all following criteria are satisfied:
-1. **Canonical FILETIME Ticks**: Process creation identity uses exact 64-bit integer tick counts (`process_creation_filetime_ticks`).
-2. **Reentrancy-Safe Hook**: WinEvent callback is minimal, guarded against reentrancy, and places compact records into a bounded queue without blocking.
-3. **Realistic Resource Expectations**: Absolute claims of zero CPU/wakeups are eliminated; realistic event-driven budgets are defined with standardized soak test experiments.
-4. **Hardened Named Pipe IPC**: VS Code named pipe architecture specifies explicit Logon SID DACL, client PID/token checks, mutual HMAC challenge-response, and 64 KB framed message bounds.
-5. **Clean Unhooking**: Teardown guarantees `UnhookWinEvent`, `WM_QUIT`, and hook thread termination within 500 ms without handle leaks.
+1. **Canonical FILETIME Ticks**: Process creation identity uses exact 64-bit integer tick counts (`process_creation_filetime_ticks`). Datetime conversion uses pure integer arithmetic with documented microsecond truncation; zero float conversion in canonical identity path.
+2. **Reentrancy-Safe Hook & Bounded Coalesced Dispatch**: WinEvent callback is minimal, guarded against reentrancy, and places compact records into a bounded queue (`maxlen=50`). Single-pending-notification mechanism ensures `pending_notification_count <= 1` at all times, preventing unbounded asyncio callback accumulation.
+3. **Realistic Resource Expectations**: Absolute claims of zero CPU/wakeups are eliminated; realistic event-driven budgets are defined with standardized soak test experiments and explicit Design Targets vs Acceptance Ceilings.
+4. **Hardened Named Pipe IPC**: VS Code named pipe architecture specifies explicit Logon SID DACL without User SID grant, strictly withholds `FILE_CREATE_PIPE_INSTANCE`, separates `dwOpenMode` from `dwPipeMode`, binds complete handshake transcript into mutual HMAC-SHA256 proofs, and restricts operations to canonical `vscode.*` metadata methods (no `provider.shutdown`).
+5. **Owner-Controlled Unhooking**: Teardown guarantees `UnhookWinEvent` is executed strictly by `WinEventHookThread`. If `thread.join(timeout=1.0)` times out, an incomplete shutdown is reported rather than claiming clean termination.

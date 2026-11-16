@@ -1,4 +1,4 @@
-# SPECIFICATION 45 — PHASE 2C: ARCHITECTURAL DECISION RECORD (ADR)
+# SPECIFICATION 45 — PHASE 2C: ARCHITECTURAL DECISION RECORD (ADR) (CORRECTED)
 # Persistent Intelligent Presence — Architectural Decisions, Technology Evaluations & Trade-offs
 
 ## 1. Executive Summary & Context
@@ -31,6 +31,7 @@ In accordance with Presence engineering principles, mature open-source projects,
 - **Status**: **APPROVED**
 - **Context**: Presence requires awareness of when the user switches applications or active windows. Continuous polling (e.g. calling `GetForegroundWindow` in a sleep loop every 500 ms) consumes continuous CPU cycles, wastes battery on laptops, and adds unnecessary wakeups.
 - **Decision**: Use `SetWinEventHook` with `EVENT_SYSTEM_FOREGROUND` (`0x0003`) and `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`.
+- **Top-Level Caption Semantics (P0-01)**: For top-level windows in other processes, `GetWindowTextW` retrieves the caption directly from the internal window structure in the desktop heap without sending cross-process `WM_GETTEXT` messages. No synthetic timeout wrappers are necessary for top-level captions.
 - **Consequences**:
   - *Positive*: Pure event-driven notification from the Windows kernel. Zero CPU utilization when the desktop is static.
   - *Positive*: Out-of-context hook avoids injecting DLLs into target processes, preventing antivirus heuristic alerts.
@@ -49,76 +50,102 @@ In accordance with Presence engineering principles, mature open-source projects,
 
 ---
 
-### ADR-2C-03: Transient In-Memory Context Snapshot vs SQLite Persistence
+### ADR-2C-03: Transient In-Memory Context Snapshot vs Persistent History (P0-02)
 - **Status**: **APPROVED**
-- **Context**: Should every observed window change be written to the SQLite database?
-- **Decision**: **No.** Environmental context is transient and held strictly in volatile RAM (active `ContextSnapshot` + 20-entry ring buffer). Context is written to SQLite **only** when an active `Step` in an executed agent turn explicitly references or acts upon that context.
+- **Context**: Should ambient context maintain a historical ring buffer of applications or write every window switch to SQLite?
+- **Decision**: **No.** Environmental context is transient and held strictly as the **single active `ContextSnapshot` in volatile RAM**. No history ring buffer of previously focused windows is maintained. Context is written to SQLite **only** when an active `Step` in an executed agent turn explicitly references or acts upon that context.
 - **Consequences**:
-  - *Positive*: Prevents unbounded SQLite database growth from normal user window switching.
+  - *Positive*: Prevents surveillance tracking and unbounded SQLite database growth from normal user window switching.
   - *Positive*: Protects user privacy: ambient window history is wiped completely when Presence exits.
   - *Positive*: SQLite trajectory schema (`runtime/trajectory.py`) remains 100% frozen with zero migration needed.
 
 ---
 
-### ADR-2C-04: Capability Integration through Existing `ToolRegistry` and `PermissionBoundary`
+### ADR-2C-04: Capability Integration through Existing `ToolRegistry` and `PermissionBoundary` (P1-07)
 - **Status**: **APPROVED**
 - **Context**: When introducing native Windows capabilities (e.g. `desktop.activate_window`, `shell.open_path`), should a new "capability execution engine" be created?
-- **Decision**: **No.** Native capabilities must register as standard tools in `ToolRegistry` and enforce authorization through `PermissionBoundary`.
+- **Decision**: **No.** Native capabilities must register as standard tools in `ToolRegistry` and enforce authorization through `PermissionBoundary` using the verified existing `AuthorityLevel` enums (`L0_OBSERVE`, `L1_RECOMMEND`, `L2_EXECUTE_REVERSIBLE`, `L3_PROTECTED`).
 - **Consequences**:
   - *Positive*: Preserves single unified execution path: `AgentExecutor -> ToolRegistry -> PermissionBoundary`.
-  - *Positive*: Automatically gains existing multi-tier security: `L0_OBSERVATION` for read-only metadata, `L2_EXECUTION` for desktop actions, and `L3_PROTECTED` with HMAC `ConsentToken` for sensitive data (clipboard).
+  - *Positive*: Automatically gains existing multi-tier security: `L0_OBSERVE` for read-only metadata, `L2_EXECUTE_REVERSIBLE` for desktop actions, and `L3_PROTECTED` with HMAC `ConsentToken` for sensitive data.
   - *Positive*: Full audit logging in trajectory steps is inherited automatically.
 
 ---
 
-### ADR-2C-05: Reversible Window Activation over Synthetic Input Injection
+### ADR-2C-05: Best-Effort Reversible Window Activation over Synthetic Input Injection (P0-06)
 - **Status**: **APPROVED**
-- **Context**: Should Presence support synthetic mouse clicks and keyboard typing (`SendInput`) to automate arbitrary desktop applications in Phase 2C?
-- **Decision**: **Reject synthetic input injection.** Phase 2C capabilities are restricted to clean, reversible desktop actions: window activation (`SetForegroundWindow`), shell opening (`ShellExecuteExW`), and application launching inside Win32 Job Objects.
+- **Context**: Should Presence support synthetic mouse clicks and keyboard typing (`SendInput`) or force foreground focus using `AttachThreadInput`?
+- **Decision**: **Reject synthetic input injection and `AttachThreadInput`.** Phase 2C capabilities are restricted to clean, reversible desktop actions. Window activation via `desktop.activate_window` is implemented as a **best-effort operation** adhering strictly to Windows foreground lock policies. If Windows denies foreground activation, Presence calls `FlashWindowEx()` to alert the user on the taskbar.
+- **Window Identity TOCTOU Guard (P1-05)**: HWNDs can be recycled. Activation requires composite verification of `HWND`, `PID`, and process creation time via `GetProcessTimes` before calling `SetForegroundWindow`.
 - **Consequences**:
-  - *Positive*: Synthetic input injection is notoriously brittle, coordinates drift with screen scaling, and missed clicks cause catastrophic accidental data deletion.
+  - *Positive*: Eliminates UI lockups, thread message corruption, and input deadlocks caused by `AttachThreadInput`.
   - *Positive*: Reversible window activation allows Presence to bring relevant windows to the user's attention safely without usurping user mouse control.
 
 ---
 
-### ADR-2C-06: Defensive XML Envelopes for Untrusted Environmental Text
+### ADR-2C-06: Defense-in-Depth for Untrusted Environmental Text (P0-04)
 - **Status**: **APPROVED**
-- **Context**: Window titles and UI text observed from third-party applications (web browsers, emails, documents) can contain malicious indirect prompt injection payloads designed to deceive the model.
-- **Decision**: Wrap all environmental text inside `<environmental_context status="observed" untrusted="true">` blocks, sanitize control characters, truncate at 200 characters, and prepend explicit constitutional untrusted-data warnings.
+- **Context**: Can XML delimiters and angle-bracket sanitization alone prevent prompt injection?
+- **Decision**: **No.** Natural language instructions ("Ignore previous instructions...") do not need XML tags. Delimiters are only defense-in-depth formatting.
+- **Architectural Defense**:
+  1. Environmental context is structured as untrusted data fields.
+  2. Model is constitutionally instructed that environmental text represents unverified user-space data, never instructions.
+  3. Model cannot grant its own permissions or create consent tokens.
+  4. Destructive tools require out-of-band HMAC-bound `ConsentToken`.
 - **Consequences**:
-  - *Positive*: Establishes structural defense-in-depth against prompt injection.
-  - *Positive*: The model is trained to treat enclosed text as metadata rather than instructions.
-  - *Positive*: Even if the model attempts an action, destructive tools are gated by `PermissionBoundary` L3 consent tokens.
+  - *Positive*: Establishes true structural defense-in-depth against prompt injection.
+  - *Positive*: Even if an LLM is deceived by a caption, the `PermissionBoundary` blocks unauthorized tool execution.
 
 ---
 
-### ADR-2C-07: In-Process Application Context Providers with Strict Timeout Isolation
+### ADR-2C-07: Respect for Windows Security Zones & Disambiguation of Shell vs Process Containment (P0-05, P1-08)
 - **Status**: **APPROVED**
-- **Context**: How should application-specific context (e.g. VS Code workspace, Windows Terminal directory) be queried?
-- **Decision**: Implement lightweight in-process provider adapters that query application state through existing interfaces (window title heuristics, CLI status queries, or local IPC) wrapped in strict **500 ms timeouts**.
+- **Context**: Should `ShellExecuteEx` use `SEE_MASK_NOZONECHECKS`, and is `ShellExecuteEx` Job Object contained?
+- **Decision**:
+  1. **Remove `SEE_MASK_NOZONECHECKS`**: Presence strictly respects Windows attachment security zones (`IAttachmentExecute`) and Mark-of-the-Web safety warnings.
+  2. **Disambiguate Shell from Process Containment**: `ShellExecuteExW` delegates to the Windows shell and may invoke existing processes, DDE, or COM servers. It does **not** guarantee a new process handle or Job Object containment.
+  3. Contained process execution must use `Win32SuspendedLauncher` (direct `CreateProcessW` with `CREATE_SUSPENDED` + Job Object assignment).
 - **Consequences**:
-  - *Positive*: Avoids running background daemon processes for each supported application.
-  - *Positive*: Timeouts prevent a slow or frozen application from stalling Presence.
-  - *Positive*: Failure of an application provider fails gracefully to generic window metadata without crashing the runtime.
+  - *Positive*: Preserves Windows OS security zone protections.
+  - *Positive*: Honest, technically accurate distinction between shell document opening and contained process execution.
 
 ---
 
-## 4. Summary of Architecture Decisions Table
+### ADR-2C-08: Deferral of Clipboard Access from Default Capabilities (P1-06)
+- **Status**: **APPROVED**
+- **Context**: Should `presence.read_clipboard` be included in Phase 2C, and can Python guarantee memory zeroization?
+- **Decision**: **Defer clipboard reading from Phase 2C.** Ambient clipboard reading violates data minimization. If implemented in a future milestone, it must be strictly user-initiated, require explicit single-use L3 consent, and clearly acknowledge Python GC / string interning limitations (no false promises of guaranteed memory zeroization).
+- **Consequences**:
+  - *Positive*: Eliminates critical accidental credential harvesting vector.
+  - *Positive*: Prevents clipboard content from leaking into external model prompts.
 
-| Decision ID | Area | Decision | Primary Justification |
+---
+
+### ADR-2C-09: Accurate Job Object Terminology (P1-08)
+- **Status**: **APPROVED**
+- **Context**: Is a Win32 Job Object a complete security sandbox?
+- **Decision**: **No.** A Win32 Job Object provides **process lifecycle containment** (kill-on-close, child termination) and **resource management** (CPU/RAM limits). It does **not** provide filesystem isolation, network isolation, or AppContainer token restriction.
+- **Consequences**:
+  - *Positive*: Eliminates inaccurate security claims in technical documentation.
+
+---
+
+## 4. Summary of Architectural Decisions Table
+
+| Decision ID | Area | Decision | Primary Technical Justification |
 |---|---|---|---|
-| **ADR-2C-01** | Context Acquisition | Native Win32 `SetWinEventHook` | Event-driven kernel notification; 0% idle CPU |
+| **ADR-2C-01** | Context Acquisition | Native Win32 `SetWinEventHook` + `GetWindowTextW` | Event-driven kernel notification; 0% idle CPU; cached caption |
 | **ADR-2C-02** | Threading | Dedicated `WinEventHookThread` | Isolates blocking Win32 message pump from asyncio loop |
-| **ADR-2C-03** | Storage | Volatile RAM Ring Buffer | Zero database bloat; privacy preservation |
-| **ADR-2C-04** | Capabilities | Native tools in `ToolRegistry` | Single execution path; unified PermissionBoundary |
-| **ADR-2C-05** | Automation | Window activation (No `SendInput`) | Brittle synthetic clicks rejected; focus safety |
-| **ADR-2C-06** | Security | Defensive XML untrusted delimiters | Indirect prompt injection defense-in-depth |
-| **ADR-2C-07** | App Providers | In-process adapters with 500ms timeout | Low overhead; hang immunity |
+| **ADR-2C-03** | Storage | Transient single active snapshot (RAM only) | Zero database bloat; privacy preservation; no ambient history |
+| **ADR-2C-04** | Capabilities | Native tools in `ToolRegistry` (`AuthorityLevel`) | Single execution path; unified PermissionBoundary; exact enums |
+| **ADR-2C-05** | Window Focus | Best-effort activation + `WindowIdentity` guard | Eliminates `AttachThreadInput` deadlocks; prevents HWND recycling TOCTOU |
+| **ADR-2C-06** | Prompt Injection | Structural untrusted data + PermissionBoundary | Natural language injection immunity; delimiters are only formatting |
+| **ADR-2C-07** | Shell Safety | Remove `SEE_MASK_NOZONECHECKS`; separate Shell/Job | Preserves security zones; accurate containment boundaries |
+| **ADR-2C-08** | Clipboard | Defer clipboard access from default Phase 2C | Eliminates credential harvesting; realistic memory zeroization |
+| **ADR-2C-09** | Terminology | Job Objects = Process Lifecycle Containment | Accurate Windows OS security taxonomy (not a security sandbox) |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 form a completely unified, coherent, and defensible architectural definition for Phase 2C. 
-
-No contradictions exist between data contracts (Spec 41), privacy constraints (Spec 42), capability contracts (Spec 43), implementation subphases (Spec 44), and technology selection records (Spec 45). The architecture is ready for final Architectural Acceptance Gate evaluation.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specification 46.

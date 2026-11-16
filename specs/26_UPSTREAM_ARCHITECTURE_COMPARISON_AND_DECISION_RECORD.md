@@ -25,6 +25,10 @@ Every decision is grounded in empirical source-code evidence, live performance d
 
 ## 2. Subsystem Architectural Decision Records (ADRs)
 
+> [!IMPORTANT]
+> **Implementation Status Update (Phase 2B.1)**:
+> All adaptations approved in this decision record (ADR-26.2: Win32 suspended launcher, ADR-26.3: Policy A/B environment separation, and default-deny MCP tool approval) have been fully implemented in `runtime/platform_win32.py`, `runtime/mcp/transport.py`, `runtime/mcp/client.py`, and `runtime/mcp/supervisor.py`. They are formally specified in Specification 27 and verified with 107 passing tests in Specification 28.
+
 ### ADR-26.1: MCP Client & Protocol Transport
 - **Decision**: **REUSE DIRECTLY**
 - **Selected Component**: `mcp.client.session.ClientSession` and `mcp.client.stdio.stdio_client` from `modelcontextprotocol/python-sdk` (Commit `77001c96`).

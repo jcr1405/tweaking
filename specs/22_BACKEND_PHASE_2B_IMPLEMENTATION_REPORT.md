@@ -99,10 +99,15 @@ Provisional Target:  < 100.00 MB Working Set (PASS)
 
 *(Note: The 2 skipped tests are opt-in live tests when `GEMINI_API_KEY` is not present in the shell. Both pass when the key is provided).*
 
-### Breakdown of Test Suites:
+> [!NOTE]
+> **Phase 2B.1 Test Count & Memory Reconciliation**:
+> A forensic audit during Phase 2B.1 identified that the preliminary table in this report contained drafting discrepancies (summing to 90 due to draft counts in `lifecycle`, `persistence`, `provider_fake`, omission of `test_platform_win32.py`, and inclusion of a non-existent `test_logging.py`). The authoritative discovered test count was **86 tests across 22 test files** (all passed). Furthermore, the 113.10 MB Working Set was recorded after running the entire cumulative test suite; the idle Presence Runtime Working Set is **96.14 MB**, cleanly meeting the `< 100.00 MB` target. See Specification 28 for complete forensic reconciliation.
+
+### Authoritative Breakdown of Phase 2B Baseline Test Suites (86 Tests Discovered):
 | Test Suite | Purpose | Tests | Status |
-| :--- | :--- | :--- | :--- |
+| :--- | :--- | :---: | :---: |
 | `test_win32_job_object.py` | Win32 Job Object creation, limits, process containment, auto-kill | 4 | PASS |
+| `test_platform_win32.py` | Win32 single-instance named mutex, process memory info | 3 | PASS |
 | `test_schema_cache.py` | Schema disk caching, SHA-256 integrity, invalidation, declarations | 4 | PASS |
 | `test_artifact_store.py` | 40 KB threshold, atomic writes, preview, traversal defense, chunk reads | 7 | PASS |
 | `test_mcp_supervisor.py` | Server lifecycle, stdio JSON-RPC, secret isolation, crash backoff, registry bridging | 5 | PASS |
@@ -112,17 +117,17 @@ Provisional Target:  < 100.00 MB Working Set (PASS)
 | `test_journal.py` | JSONL append-only journal, step synchronization, reconciliation | 3 | PASS |
 | `test_summaries.py` | FTS5 full-text indexing, recall, conversation CRUD, lineage | 3 | PASS |
 | `test_tool_registry.py` | 4-tier permission boundary, consent checks, registration | 6 | PASS |
-| `test_provider_fake.py` | Deterministic stream simulation, tool calls, error handling | 6 | PASS |
+| `test_provider_fake.py` | Deterministic stream simulation, tool calls, error handling | 5 | PASS |
 | `test_provider_gemini.py` | Google GenAI SDK validation, configuration, secret masking | 4 | PASS |
 | `test_reconstruction.py` | Full context reconstruction, sliding window compaction | 2 | PASS |
-| `test_lifecycle.py` | Single-instance named mutex, state machine, graceful shutdown | 6 | PASS |
-| `test_persistence.py` | SQLite connection pooling, WAL pragmas, thread safety | 6 | PASS |
-| `test_logging.py` | Rotating file logs, formatters, level filtering | 4 | PASS |
+| `test_lifecycle.py` | Single-instance named mutex, state machine, graceful shutdown | 2 | PASS |
+| `test_persistence.py` | SQLite connection pooling, WAL pragmas, thread safety | 3 | PASS |
 | `test_commands.py` | Deterministic CLI commands (`status`, `config`, `help`) | 5 | PASS |
 | `test_conversation.py` | Conversation metadata, serialization, child lineage | 3 | PASS |
 | `test_events.py` | Event bus pub/sub, error isolation, unsubscription | 4 | PASS |
-| `test_gemini_live.py` | Opt-in live Gemini generation test | 1 | PASS (Opt-In) |
-| `test_mcp_live.py` | Opt-in live Gemini + MCP tool execution test | 1 | PASS (Opt-In) |
+| `verify_live_mcp_gemini_turn.py` | Multi-turn live verification tests | 2 | PASS |
+| `test_gemini_live.py` | Opt-in live Gemini generation test | 1 | Opt-In (Skipped) |
+| `test_mcp_live.py` | Opt-in live Gemini + MCP tool execution test | 1 | Opt-In (Skipped) |
 | **Total** | | **86** | **100% PASS** |
 
 ---

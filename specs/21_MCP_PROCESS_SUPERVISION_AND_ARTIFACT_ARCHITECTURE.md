@@ -60,6 +60,8 @@ Presence interacts directly with `kernel32.dll` using `ctypes` (`runtime/platfor
 - `CreateJobObjectW(None, job_name)`
 - `SetInformationJobObject` setting `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` with `LimitFlags |= 0x2000` (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 - Hooked process creation (`mcp.client.stdio._create_platform_compatible_process`) captures the root child PID and invokes `AssignProcessToJobObject`.
+> [!NOTE]
+> **Phase 2B.1 Hardening Update**: The post-spawn assignment and private SDK monkey-patch described above were superseded in Phase 2B.1 by `Win32SuspendedLauncher` (`runtime/platform_win32.py`) and `win32_mcp_stdio_transport` (`runtime/mcp/transport.py`). Subprocesses are now launched in `CREATE_SUSPENDED` state with explicit handle filtering (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), assigned to the Job Object before execution, verified via `IsProcessInJob`, and resumed via `ResumeThread`. Official AnyIO memory streams connect directly to `ClientSession` with zero monkey-patching. See Specification 27 and Specification 28.
 - Windows automatically captures any descendant processes spawned by the root process into the same job object.
 - **Kernel-Guaranteed Cleanup**: When `MCPClientSession.stop()`, runtime shutdown, or a process crash occurs, closing the job handle or terminating the job atomically terminates every single process in the tree. Zero orphaned processes.
 

@@ -1,0 +1,5 @@
+# Presence Agent Engine Dependencies
+# Python 3.12+ (isolated virtual environment)
+google-genai==3.3.0
+mcp==2.3.0
+psutil>=5.9.8

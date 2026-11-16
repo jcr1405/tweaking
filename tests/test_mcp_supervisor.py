@@ -38,7 +38,8 @@ class TestMCPSupervisor(unittest.TestCase):
             shutdown_timeout=5.0,
             max_restarts=2,
             restart_backoff_seconds=0.2,
-            default_authority_tier=PermissionTier.L0_OBSERVE
+            default_authority_tier=PermissionTier.L0_OBSERVE,
+            approved_tools=["echo", "generate_large_payload", "get_env_var", "trigger_crash"]
         )
         self.supervisor.register_server(self.server_config)
 

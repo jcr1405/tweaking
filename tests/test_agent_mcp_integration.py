@@ -66,7 +66,8 @@ class TestAgentMCPIntegration(unittest.TestCase):
             args=[str(fixture_path)],
             startup_timeout=15.0,
             request_timeout=10.0,
-            default_authority_tier=PermissionTier.L0_OBSERVE
+            default_authority_tier=PermissionTier.L0_OBSERVE,
+            approved_tools=["echo", "generate_large_payload", "get_env_var"]
         )
         self.supervisor.register_server(self.server_config)
 

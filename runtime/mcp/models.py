@@ -38,6 +38,16 @@ class MCPServerConfig:
     enabled: bool = True
     default_authority_tier: PermissionTier = PermissionTier.L0_OBSERVE
     tool_tiers: Dict[str, PermissionTier] = field(default_factory=dict)
+    approved_tools: Optional[List[str]] = None
+    auto_approve_tools: bool = False
+
+    def is_tool_approved(self, tool_name: str) -> bool:
+        """Determines if a tool is explicitly approved under local configuration policy (default-deny)."""
+        if self.auto_approve_tools:
+            return True
+        if self.approved_tools is not None:
+            return tool_name in self.approved_tools
+        return False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,7 +64,9 @@ class MCPServerConfig:
             "max_restarts": self.max_restarts,
             "enabled": self.enabled,
             "default_authority_tier": self.default_authority_tier.name,
-            "tool_tiers": {k: v.name for k, v in self.tool_tiers.items()}
+            "tool_tiers": {k: v.name for k, v in self.tool_tiers.items()},
+            "approved_tools": self.approved_tools,
+            "auto_approve_tools": self.auto_approve_tools,
         }
 
 
@@ -65,6 +77,7 @@ class MCPToolInfo:
     tool_name: str
     description: str
     input_schema: Dict[str, Any]
+    approved: bool = False
 
     @property
     def namespaced_name(self) -> str:
@@ -77,7 +90,8 @@ class MCPToolInfo:
             "tool_name": self.tool_name,
             "namespaced_name": self.namespaced_name,
             "description": self.description,
-            "input_schema": self.input_schema
+            "input_schema": self.input_schema,
+            "approved": self.approved
         }
 
     @classmethod
@@ -86,7 +100,8 @@ class MCPToolInfo:
             server_id=data["server_id"],
             tool_name=data["tool_name"],
             description=data.get("description", ""),
-            input_schema=data.get("input_schema", {})
+            input_schema=data.get("input_schema", {}),
+            approved=data.get("approved", False)
         )
 
 

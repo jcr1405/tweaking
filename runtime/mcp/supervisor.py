@@ -44,6 +44,7 @@ class MCPSupervisor:
         # Pre-load cached schemas if available for lazy hydration
         cached_tools = self.schema_cache.load_server_schemas(config.server_id)
         for t in cached_tools:
+            t.approved = config.is_tool_approved(t.tool_name)
             self._discovered_tools[config.server_id][t.tool_name] = t
 
         logger.info(f"Registered MCP server configuration '{config.server_id}' ({config.name}). Cached tools: {len(cached_tools)}")
@@ -97,6 +98,8 @@ class MCPSupervisor:
 
         # Discover and cache tools
         tools = new_session.list_tools()
+        for t in tools:
+            t.approved = config.is_tool_approved(t.tool_name)
         self._discovered_tools[server_id] = {t.tool_name: t for t in tools}
         self.schema_cache.save_server_schemas(server_id, tools)
         logger.info(f"MCP server '{server_id}' started successfully with {len(tools)} tool(s).")
@@ -148,10 +151,20 @@ class MCPSupervisor:
             self.stop_server(server_id)
 
     def execute_tool(self, server_id: str, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes a tool on an MCP server with automatic lazy startup and crash recovery."""
+        """Executes a tool on an MCP server with automatic lazy startup, crash recovery, and approval checks."""
         config = self._configs.get(server_id)
         if not config:
             return {"status": "ERROR", "error": f"MCP server '{server_id}' is not configured."}
+
+        # Check explicit tool approval policy (default-deny)
+        if not config.is_tool_approved(tool_name):
+            logger.warning(f"Rejected execution of unapproved MCP tool '{tool_name}' on server '{server_id}' (default-deny).")
+            return {
+                "status": "ERROR",
+                "error": f"Tool '{tool_name}' on MCP server '{server_id}' is unapproved (default-deny policy).",
+                "server_id": server_id,
+                "tool": tool_name
+            }
 
         # Lazy startup if not currently running
         session = self._sessions.get(server_id)
@@ -209,6 +222,11 @@ class MCPSupervisor:
                 tools_map = self._discovered_tools.get(sid, {})
 
             for t_name, t_info in tools_map.items():
+                if not config.is_tool_approved(t_name):
+                    logger.info(f"Skipping unapproved MCP tool '{t_name}' on server '{sid}' (default-deny policy).")
+                    continue
+
+                t_info.approved = True
                 namespaced_id = t_info.namespaced_name
                 tier = config.tool_tiers.get(t_name, config.default_authority_tier)
 

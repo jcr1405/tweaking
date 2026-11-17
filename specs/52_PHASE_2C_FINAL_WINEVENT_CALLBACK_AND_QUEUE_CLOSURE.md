@@ -200,16 +200,11 @@ The interaction between the producer thread (`WinEventHookThread`) and consumer 
 ```
 [WinEventHookThread]                           [AsyncIO Consumer Task]
 ====================                           =======================
-(1) Event Append:
-    queue.push(event)
-    [Non-blocking try-lock]
+(1 & 2) Atomic Push & Notification:
+    pushed, signal = queue.push(event)
+    [Non-blocking try-lock on unified monitor]
            │
-(2) Notification Transition:
-    with _state_lock:
-        if not _notification_pending:
-            _notification_pending = True
-           │
-(3) Threadsafe Signal:
+(3) Threadsafe Signal (if signal):
     loop.call_soon_threadsafe(
         event_available.set
     )
@@ -217,17 +212,13 @@ The interaction between the producer thread (`WinEventHookThread`) and consumer 
                                                    await event_available.wait()
                                                    event_available.clear()
                                                           │
-                                               (5) Reset Notification:
-                                                   with _state_lock:
-                                                       _notification_pending = False
+                                               (5 & 6) Atomic Drain & Reset:
+                                                   batch = queue.drain_and_reset()
+                                                   [Holds unified monitor for O(capacity)]
                                                           │
-                                               (6) Atomic Batch Drain:
-                                                   batch = queue.drain()
-                                                   [Holds _lock for O(capacity)]
-                                                          │
-                                               (7) Mandatory Live State Refresh:
+                                               (7) Mandatory Live State Refresh & Freshness Check:
                                                    active_hwnd = GetForegroundWindow()
-                                                   authoritative_refreshes += 1
+                                                   [Post-collection check verifies freshness]
                                                           │
                                                (8) Asynchronous Processing:
                                                    await _process_foreground_event(...)
@@ -277,18 +268,20 @@ The interaction between the producer thread (`WinEventHookThread`) and consumer 
 
 ## 6. CPython GIL Reality & Latency Guarantees
 
-### 6.1 Formal Withdrawal of "< 50 μs" Hard Numerical Guarantee
-Previous iterations included an unverified assertion that callback dispatch executes in "< 50 μs". Presence formally withdraws this numerical guarantee as architecturally unsound under CPython:
+### 6.1 Formal Withdrawal of Unverified Numerical Guarantees
+Previous iterations included assertions that callback dispatch executes in "< 50 μs" or that bytecode execution executes in "0.2–0.5 μs". Presence formally withdraws all such numerical claims as architecturally unverified under CPython:
 
 1. **Foreign-Thread GIL Entry**: The Win32 `WinEventProc` callback is executed on an OS thread created by Windows or the native message pump. Invoking Python code through ctypes requires `PyGILState_Ensure()`.
-2. **GIL Contention Under CPU Load**: If another Python thread is executing a CPU-intensive operation (e.g., token parsing, JSON serialization, SQLite compression), the hook thread must wait for the interpreter thread switch interval (`sys.getswitchinterval()`, default 5 ms).
+2. **GIL Contention Under CPU Load**: If another Python thread is executing a CPU-intensive operation, the hook thread must wait for an interpreter thread switch. Crucially, `sys.getswitchinterval()` (default 5 ms) is an ideal timeslice target for the evaluation loop, not a guaranteed real-time upper bound on OS scheduling delay.
 3. **No Hard Real-Time Guarantee**: CPython cannot guarantee hard real-time latency boundaries without an unmanaged native C queue compiled into a custom DLL.
 
-### 6.2 Realistic, Verified Engineering Guarantees
-Presence provides realistic, verified guarantees:
-- **Zero Application-Level Blocking Waits**: The callback code contains zero blocking lock acquisitions (`acquire(blocking=False)`), zero disk I/O, zero COM calls, and zero IPC transmissions.
-- **Sub-Microsecond Bytecode Execution**: Once the GIL is acquired, the callback executes strictly 10 Python bytecodes (monotonic timestamp, tuple allocation, try-lock, deque append, unlock), executing in ~0.2–0.5 μs on modern x64 hardware.
-- **Bounded Jitter via Dedicated Architecture**: Presence minimizes GIL contention by isolating background workloads, running CPU-heavy analysis asynchronously or in external processes, and maintaining low overall interpreter utilization.
+### 6.2 Five-Layer Latency & Execution Classification
+Presence defines realistic, verified guarantees by distinguishing five distinct execution layers:
+- **Application-Level Lock Waits**: Strictly **zero**. The callback code contains zero blocking lock acquisitions (`acquire(blocking=False)`), zero disk I/O, zero COM calls, and zero IPC transmissions.
+- **Callback-Body Execution**: Pure algorithmic in-memory operations ($O(1)$ deque append and flag check); zero allocation spikes and zero system calls.
+- **CPython GIL Acquisition**: Handled by `PyGILState_Ensure()`; scheduling delay is governed by interpreter evaluation timeslices and background Python workloads.
+- **OS Thread Scheduling**: Thread quantum and priority scheduling between the hook thread and background OS processes.
+- **Native Win32 Message Delivery**: Event dispatch via User32 message pump (`GetMessageW` / `DispatchMessageW`).
 
 ---
 
@@ -299,10 +292,10 @@ Presence provides realistic, verified guarantees:
 |---|---|:---:|---|
 | **Event Push** | `BoundedEventQueue.push()` | $O(1)$ | Non-blocking try-lock + bounded deque append. |
 | **Batch Drain** | `BoundedEventQueue.drain()` | $O(n)$ | Strictly bounded by $O(\text{capacity} = 64)$ items. |
-| **Notification Check** | `_state_lock` transition | $O(1)$ | Single boolean check and assignment. |
+| **Notification Check** | Unified monitor transition | $O(1)$ | Single boolean check and assignment under try-lock. |
 | **Live State Refresh** | `GetForegroundWindow()` | $O(1)$ | Win32 kernel/User32 handle table lookup. |
 
-*Correction Note*: Specification 50 erroneously described batch drain as $O(1)$. In Python, `list(self._deque)` iterates over $n$ elements to create the list, making it $O(n)$. Because $n \le 64$, execution time is bounded to $\approx 350 \ \text{ns}$, but it is formally $O(\text{capacity})$, not $O(1)$.
+*Correction Note*: Specification 50 erroneously described batch drain as $O(1)$. In Python, `list(self._deque)` iterates over $n$ elements to create the list, making it $O(n)$. Because $n \le 64$, execution time is strictly bounded by $O(\text{capacity} = 64)$, not $O(1)$.
 
 ### 7.2 Peak Heap Memory Accounting
 The memory footprint of `BoundedEventQueue` is strictly bounded and calculated below:
@@ -403,8 +396,8 @@ Test 10: Invariant verification (active_consumer_count <= 1)...
 | **Gate K** | Named-pipe / libuv client compatibility | Phase 2C.5 | **`PASS — EXPERIMENTALLY VERIFIED`** |
 | **Gate L** | DACL instance creation denial verified | Phase 2C.5 | **`PASS — EXPERIMENTALLY VERIFIED`** |
 | **Gate M** | Genuine pipe-squatting fail-closed verified | Phase 2C.5 | **`PASS — EXPERIMENTALLY VERIFIED`** |
-| **Gate N** | Non-blocking try-lock callback & split drop accounting | Phase 2C.1 | **`PASS — EXPERIMENTALLY VERIFIED`** |
-| **Gate O** | Mandatory live `GetForegroundWindow()` refresh on every wake | Phase 2C.1 | **`PASS — EXPERIMENTALLY VERIFIED`** |
+| **Gate N** | Non-blocking try-lock callback & split drop accounting | Phase 2C.1 | **`PASS — HARNESS EXPERIMENTALLY VERIFIED (Native Hook Integration Pending Phase 2C.1)`** |
+| **Gate O** | Mandatory live `GetForegroundWindow()` refresh on every wake | Phase 2C.1 | **`PASS — HARNESS EXPERIMENTALLY VERIFIED (Native User32 Integration Pending Phase 2C.1)`** |
 
 ---
 

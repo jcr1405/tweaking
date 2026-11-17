@@ -240,26 +240,28 @@ In accordance with Presence engineering principles, mature open-source projects,
 - **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Hook callbacks entering Python via ctypes must acquire the CPython GIL (`PyGILState_Ensure`). Index ownership in circular queues must remain strictly separated. Hook destruction ownership must belong strictly to the installing thread, and processing tasks must remain bounded.
 - **Decision**:
   1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
-  2. Implement reentrancy guard (`_in_callback` flag) and bounded Python queue (`collections.deque(maxlen=64)` protected by an internal lock). Usable capacity is exactly **64 entries**, operated via non-blocking try-lock (`acquire(blocking=False)`).
-  3. **Strict Ownership, Contention & Overflow Model (P2C-35, P2C-39)**:
+  2. Implement reentrancy guard (`_in_callback` flag) and bounded Python queue (`collections.deque(maxlen=64)` protected by an internal monitor). Usable capacity is exactly **64 entries**, operated via non-blocking try-lock (`acquire(blocking=False)`). Completely eliminates secondary blocking locks (`_state_lock` eliminated).
+  3. **Strict Ownership, Contention & Overflow Model (P2C-35, P2C-39, P2C-41, P2C-42)**:
      - Producer appends to queue and owns drop accounting (`events_dropped_capacity` and `events_dropped_contention`). Producer never modifies consumer read state.
-     - Consumer drains batches ($O(n)$ bounded by $O(\text{capacity} = 64)$, memory $< 8 \ \text{KB}$) and owns processing telemetry. Consumer never modifies producer write state.
+     - Consumer drains batches ($O(n)$ bounded by $O(\text{capacity} = 64)$, memory estimated at $\approx 11.1 \ \text{KB}$) and owns processing telemetry. Consumer never modifies producer write state.
      - Contention policy: if consumer holds lock during batch drain, producer try-lock immediately returns False without blocking the Win32 message pump, incrementing `events_dropped_contention`.
      - Capacity policy: when queue reaches 64 items, newest incoming event is dropped, incrementing `events_dropped_capacity`.
-     - Live recovery: on every wake, consumer unconditionally executes a mandatory live state refresh via `GetForegroundWindow()`, ensuring authoritative active window tracking despite any dropped intermediate events.
-  4. **CPython GIL Reality (P2C-37, P2C-39)**:
-     - The ctypes callback entering Python acquires the GIL (`PyGILState_Ensure`). System guarantees zero application-level blocking lock waits and microsecond execution latency without unverified hard real-time (< 50 μs) claims.
-  5. Implement **Wake-Up Coalescing & Supervised Single Consumer Worker (P2C-24, P2C-33, P2C-40)**:
-     - Synchronized state flag `_notification_pending: bool`.
-     - When producer pushes into queue: if `_notification_pending` is False, sets flag to True and signals consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
+     - Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False` and batch-drains the deque.
+  4. **CPython GIL & Latency Classification (P2C-37, P2C-39, P2C-44)**:
+     - Distinguishes five distinct layers: zero application-level blocking lock waits, $O(1)$ callback-body execution, CPython GIL acquisition (`sys.getswitchinterval()` is an ideal timeslice target, not an absolute real-time bound), OS thread scheduling, and Win32 message dispatch. All unverified numerical latency claims (`<50 μs`, `0.2–0.5 μs`) are formally withdrawn.
+  5. Implement **Wake-Up Coalescing, Freshness Contract & Supervised Worker (P2C-24, P2C-33, P2C-40, P2C-47)**:
+     - Single-pending notification flag synchronized by the unified monitor.
      - Supervised single consumer worker task maintains invariants:
        $$\text{active\_foreground\_consumer\_count} \le 1, \quad \text{pending\_notification\_count} \le 1, \quad \text{queue\_depth} \le 64 \quad \forall t$$
-     - Worker wakes on `_event_available.wait()`, clears the event, resets notification flag, drains queue, executes mandatory `GetForegroundWindow()` refresh, and processes outside synchronization boundaries.
+     - Mandatory authoritative live state refresh: On every wake, consumer queries `GetForegroundWindow()`.
+     - Freshness validation contract (P2C-47): Consumer checks `hwnd_final == hwnd_initial` and `IsWindow(hwnd_initial)` post-inspection. Stale snapshots resulting from mid-inspection focus changes are aborted (`stale_snapshots_aborted += 1`), preserving the single-current-snapshot model.
   6. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
      - `UnhookWinEvent(self._hHook)` is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
      - Runtime thread joins hook thread with 1.0s timeout. If alive after timeout, reports `HookShutdownTimeoutError` (do not claim clean termination).
   7. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
+  - *Secondary _state_lock on coordinator*: Introduced application-level blocking lock waits on callback path. Corrected by unifying queue and notification under a single monitor.
+  - *Unchecked single GetForegroundWindow query*: Allowed committing stale metadata if focus shifted during metadata collection. Resolved via Post-Collection Freshness Check.
   - *SPSC index mutation across threads*: Violates single-producer ownership and causes race conditions during overflow. Corrected.
   - *Native C DLL Queue*: Adds compilation, binary distribution, and unmanaged crash risks without measurable real-world benefit over bounded Python queue. Rejected.
   - *Blocking lock acquisition in hook proc*: Stalls the Win32 message pump during consumer contention. Rejected.
@@ -295,10 +297,10 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
 | **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004 (isolated DACL test verified); fullmatch validation; session key reserved/deferred |
-| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Non-blocking try-lock queue (capacity 64); contention drop accounting; mandatory live GetForegroundWindow() refresh; GIL awareness; wake-up coalescing (`<= 1`); single consumer worker (`<= 1`); owner unhooks |
+| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Unified non-blocking monitor (capacity 64); zero secondary locks; contention drop accounting; mandatory live GetForegroundWindow() refresh with freshness check; GIL 5-layer classification; wake-up coalescing (`<= 1`); single consumer worker (`<= 1`); owner unhooks |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 52.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 53.

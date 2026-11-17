@@ -352,12 +352,12 @@ class BoundedEventQueue:
         self._faulted = True
 
     def drain_and_reset(self) -> list:
-        """Consumer / Shutdown: batch drains queue and resets notification flag."""
+        """Consumer / Shutdown: batch drains queue and resets notification flag. P2C-62: _faulted is STICKY."""
         with self._lock:
             batch = list(self._deque)
             self._deque.clear()
             self._notification_pending = False
-            self._faulted = False
+            # P2C-62: _faulted is a monotonic one-way latch; never cleared by drain_and_reset()!
             self.events_drained += len(batch)
             return batch
 

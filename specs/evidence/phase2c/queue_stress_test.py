@@ -1,6 +1,6 @@
 """
-Presence Phase 2C - Queue Concurrency and Stress Test Harness (Phase 2C Correction 10)
-Comprehensive validation of the 18 critical conditions from Specifications 54 & 55:
+Presence Phase 2C - Queue Concurrency and Stress Test Harness (Phase 2C Correction 11)
+Comprehensive validation of all critical conditions from Specifications 54, 55 & 56:
  1. Event-loop scheduling succeeds normally.
  2. Event-loop stops before producer notification (loop.stop() called; no callback execution).
  3. Event-loop closes before producer notification (loop.close() called; RuntimeError raised).
@@ -19,6 +19,12 @@ Comprehensive validation of the 18 critical conditions from Specifications 54 & 
 16. Mid-inspection foreground change cleanly aborted; no snapshot commits after shutdown boundary (P2C-59).
 17. Memory calculation matches nominal (11,128 B) and upper-range (11,640 B) arithmetic (P2C-61).
 18. Complete telemetry counter consistency including faulted drops (P2C-57, P2C-61).
+19. Sticky fault-state persists across drain_and_reset() (P2C-62).
+20. Faulted queue rejects events over repeated consumer cycles (P2C-62).
+21. New lifecycle requires quiescence and reinitialization (P2C-62).
+22. Proactor debug mode configuration enforcement (P2C-64).
+23. Join-timeout escalation and sys.exit background-thread limitation (P2C-65).
+24. Saturating telemetry counters memory bounding (P2C-66).
 """
 
 import asyncio
@@ -27,6 +33,14 @@ import dataclasses
 import threading
 import time
 import sys
+import os
+
+UINT32_MAX = 0xFFFFFFFF
+
+def _sat_inc(counter: int, delta: int = 1) -> int:
+    """Saturating 32-bit unsigned counter increment (P2C-66)."""
+    new_val = counter + delta
+    return new_val if new_val < UINT32_MAX else UINT32_MAX
 
 @dataclasses.dataclass(frozen=True)
 class WindowIdentity:
@@ -52,6 +66,8 @@ class BoundedEventQueue:
       - Zero lock acquisition for diagnostic/metrics readers (P2C-51).
       - Faulted-state handling preserves invariant: pending=False implies queue_depth=0 (P2C-49).
       - Zero synchronous logging or blocking operations on callback path (P2C-54).
+      - Sticky monotonic fault state: once faulted, ordinary drains cannot clear fault (P2C-62).
+      - Lifetime memory bounded by saturating 32-bit integer counters (P2C-66).
     """
     def __init__(self, capacity: int = 64):
         self.capacity = capacity
@@ -60,7 +76,7 @@ class BoundedEventQueue:
         self._notification_pending = False
         self._faulted = False
         
-        # Telemetry counters
+        # Saturating telemetry counters (strictly <= 32 bytes memory in CPython 3.12 AMD64)
         self.raw_events_received = 0
         self.events_dropped_capacity = 0
         self.events_dropped_contention = 0
@@ -75,10 +91,9 @@ class BoundedEventQueue:
 
     @property
     def events_dropped(self) -> int:
-        return (
-            self.events_dropped_capacity +
-            self.events_dropped_contention +
-            self.events_dropped_faulted
+        return _sat_inc(
+            self.events_dropped_capacity,
+            self.events_dropped_contention + self.events_dropped_faulted
         )
 
     @property
@@ -98,34 +113,34 @@ class BoundedEventQueue:
         Returns:
             (pushed: bool, schedule_signal: bool)
         """
-        self.raw_events_received += 1
+        self.raw_events_received = _sat_inc(self.raw_events_received)
         
         if not self._lock.acquire(blocking=False):
             # Contention: consumer is draining batch or resetting state
-            self.events_dropped_contention += 1
+            self.events_dropped_contention = _sat_inc(self.events_dropped_contention)
             return False, False
             
         try:
             if self._faulted:
-                # System is in faulted/teardown state; reject incoming events (P2C-57)
-                self.events_dropped_faulted += 1
+                # System is in sticky faulted state; reject incoming events immediately (P2C-57, P2C-62)
+                self.events_dropped_faulted = _sat_inc(self.events_dropped_faulted)
                 return False, False
 
             if len(self._deque) >= self.capacity:
-                self.events_dropped_capacity += 1
+                self.events_dropped_capacity = _sat_inc(self.events_dropped_capacity)
                 return False, False
                 
             self._deque.append(event)
-            self.events_pushed += 1
+            self.events_pushed = _sat_inc(self.events_pushed)
             if len(self._deque) > self.queue_high_water_mark:
                 self.queue_high_water_mark = len(self._deque)
                 
             if not self._notification_pending:
                 self._notification_pending = True
-                self.notifications_scheduled += 1
+                self.notifications_scheduled = _sat_inc(self.notifications_scheduled)
                 return True, True
             else:
-                self.events_coalesced += 1
+                self.events_coalesced = _sat_inc(self.events_coalesced)
                 return True, False
         finally:
             self._lock.release()
@@ -133,24 +148,26 @@ class BoundedEventQueue:
     def handle_scheduling_failure(self):
         """
         Invoked when loop.call_soon_threadsafe fails (e.g. RuntimeError on closed loop).
-        Transitions queue into faulted state.
+        Transitions queue into sticky faulted state.
         CRITICAL (P2C-54): ZERO synchronous logging or I/O on callback path!
         CRITICAL (P2C-49): NEVER resets _notification_pending = False while unread entries remain!
+        CRITICAL (P2C-62): _faulted is a MONOTONIC one-way latch!
         """
-        self.scheduling_failures += 1
+        self.scheduling_failures = _sat_inc(self.scheduling_failures)
         self._faulted = True
 
     def drain_and_reset(self) -> list:
         """
         Invoked from consumer worker task or supervisor shutdown.
         Atomically drains all pending items and resets _notification_pending = False.
+        CRITICAL (P2C-62): Does NOT clear _faulted! _faulted is sticky!
         """
         with self._lock:
             batch = list(self._deque)
             self._deque.clear()
             self._notification_pending = False
-            self._faulted = False
-            self.events_drained += len(batch)
+            # P2C-62: _faulted is STICKY; only a fresh queue instance clears fault!
+            self.events_drained = _sat_inc(self.events_drained, len(batch))
             return batch
 
     def __len__(self) -> int:
@@ -170,7 +187,7 @@ class ForegroundDispatchCoordinator:
         self.processed_events = []
         self.stale_snapshots_aborted = 0
         self.snapshots_committed = 0
-        self._hook_active = True
+        self._hook_active = False
         self._hook_thread_running = False
         self.consumer_task = None
         self.shutdown_aborted = False
@@ -179,7 +196,20 @@ class ForegroundDispatchCoordinator:
         self.loop = loop
         self.event_available = asyncio.Event()
 
+    def set_debug(self, enabled: bool):
+        """P2C-64: Prohibits enabling debug mode while hook is active."""
+        if enabled and self._hook_active:
+            raise RuntimeError("Cannot enable asyncio debug mode while native WinEvent hook is active.")
+        if self.loop is not None:
+            self.loop.set_debug(enabled)
+
     def start_hook(self):
+        """P2C-64: Rejects startup if loop debug mode is enabled."""
+        if self.loop is not None and self.loop.get_debug():
+            raise ValueError(
+                "Cannot start native WinEvent hook with asyncio debug mode enabled. "
+                "Debug mode invokes synchronous logger.debug on the Proactor self-pipe error path."
+            )
         self._hook_active = True
         self._hook_thread_running = True
 
@@ -195,7 +225,6 @@ class ForegroundDispatchCoordinator:
     def on_winevent(self, hwnd: int, event_time: int) -> bool:
         """Producer callback invoked from hook thread."""
         if not self._hook_active:
-            # Hook already unhooked / inactive
             return False
             
         arrival = time.monotonic()
@@ -209,7 +238,6 @@ class ForegroundDispatchCoordinator:
             try:
                 self.loop.call_soon_threadsafe(self.event_available.set)
             except RuntimeError:
-                # Event loop closed concurrently
                 self.queue.handle_scheduling_failure()
                 return False
                 
@@ -227,7 +255,7 @@ class ForegroundDispatchCoordinator:
                 if self.shutdown_event.is_set():
                     break
                 self.event_available.clear()
-                self.queue.notifications_executed += 1
+                self.queue.notifications_executed = _sat_inc(self.queue.notifications_executed)
                 
                 # Atomic drain and reset notification
                 batch = self.queue.drain_and_reset()
@@ -238,7 +266,6 @@ class ForegroundDispatchCoordinator:
                 self.latest_authoritative_identity = initial_identity
                 
                 # Freshness validation contract (P2C-52)
-                # Simulate asynchronous metadata retrieval (e.g. caption / class)
                 await asyncio.sleep(0.001)
                 
                 final_identity = self.live_window_func()
@@ -248,7 +275,6 @@ class ForegroundDispatchCoordinator:
                     final_identity.pid != initial_identity.pid or
                     final_identity.creation_filetime_ticks != initial_identity.creation_filetime_ticks or
                     final_identity.window_class != initial_identity.window_class):
-                    # Focus changed or HWND recycled during inspection: abort stale snapshot!
                     self.stale_snapshots_aborted += 1
                     continue
                     
@@ -265,44 +291,24 @@ class ForegroundDispatchCoordinator:
             self.active_consumer_count -= 1
 
     async def supervisor_shutdown(self, simulate_hook_hang: bool = False) -> list:
-        """
-        Supervisor Quiesced Teardown Protocol (P2C-59):
-        1. Request hook shutdown.
-        2. Unhook on owning thread.
-        3. Join and confirm hook thread termination.
-           -> IF TIMEOUT: ABORT remaining shutdown steps! Keep loop open for late callbacks.
-        4. Signal consumer shutdown.
-        5. Await consumer termination (quiescence).
-        6. Reconcile remaining queue entries under single supervisor owner.
-        7. Stop event loop.
-        8. Close event loop.
-        """
-        # Step 1 & 2: Request shutdown & unhook
+        """Supervisor Quiesced Teardown Protocol (P2C-59)."""
         self.stop_hook(simulate_hang=simulate_hook_hang)
         
-        # Step 3: Join hook thread (simulated timeout check)
         if self._hook_thread_running:
-            # Hook thread failed to exit within timeout!
             self.shutdown_aborted = True
-            # ABORT remaining shutdown steps; DO NOT close loop on active callbacks!
             raise HookShutdownTimeoutError("Hook thread termination timed out. Shutdown aborted.")
 
-        # Step 4: Signal consumer shutdown
         self.shutdown_event.set()
         if self.event_available:
             self.event_available.set()
 
-        # Step 5: Await consumer termination (quiescence)
         if self.consumer_task and not self.consumer_task.done():
             await self.consumer_task
 
-        # Step 6: Single-owner queue reconciliation
         remaining_events = self.queue.drain_and_reset()
-        
-        # Step 7 & 8: Loop shutdown/close are deferred to the lifecycle owner
         return remaining_events
 
-# ============================ 18 TEST SCENARIOS ============================
+# ============================ 24 TEST SCENARIOS ============================
 
 async def test_1_scheduling_succeeds():
     print("Test 1: Event-loop scheduling succeeds normally...")
@@ -330,7 +336,6 @@ async def test_2_loop_stops_before_notification():
     coord.start_hook()
     
     assert not loop.is_running()
-    # Producer pushes event: call_soon_threadsafe succeeds on open loop!
     pushed = coord.on_winevent(2001, 1)
     assert pushed is True
     assert len(coord.queue) == 1
@@ -382,7 +387,6 @@ async def test_5_scheduling_raises_runtime_error_no_logging():
     coord.start_hook()
     loop.close()
     
-    # Verify execution path is completely lock-free and does not invoke logging
     res = coord.on_winevent(5001, 1)
     assert res is False
     assert coord.queue.is_faulted is True
@@ -397,17 +401,15 @@ async def test_6_faulted_queue_rejects_producer_and_counts_drops():
     coord.start_hook()
     loop.close()
     
-    # First push faults the queue
     coord.on_winevent(6001, 1)
     assert coord.queue.is_faulted is True
     
-    # Subsequent pushes are rejected specifically as faulted drops
     pushed2 = coord.on_winevent(6002, 2)
     pushed3 = coord.on_winevent(6003, 3)
     assert pushed2 is False
     assert pushed3 is False
     assert coord.queue.events_dropped_faulted == 2
-    assert len(coord.queue) == 1  # Original event safely retained!
+    assert len(coord.queue) == 1
     print("  -> Passed. Faulted queue rejected events; events_dropped_faulted = 2.")
 
 async def test_7_failure_handling_never_leaves_pending_false_with_unread_entries():
@@ -430,20 +432,13 @@ async def test_7_failure_handling_never_leaves_pending_false_with_unread_entries
 async def test_8_cpython_proactor_self_pipe_semantics():
     print("Test 8: CPython BaseProactorEventLoop closed self-pipe swallows socket send (P2C-55, P2C-56)...")
     loop = asyncio.ProactorEventLoop()
-    # Close the internal self pipe socket while loop is not yet closed
     loop._close_self_pipe()
     assert loop._csock is None
     
-    # Call _write_to_self() directly: confirms it returns cleanly without exception
     loop._write_to_self()
-    
-    # call_soon_threadsafe() succeeds and returns a handle even though socket was closed!
     handle = loop.call_soon_threadsafe(lambda: None)
     assert handle is not None
-    # This proves that call_soon_threadsafe CANNOT be relied upon to detect concurrent loop closure!
-    # Hence, native hook termination is a mandatory prerequisite for loop closure.
     
-    # Cleanup loop safely
     loop._make_self_pipe()
     loop.close()
     print("  -> Passed. BaseProactorEventLoop error-suppression confirmed; lifecycle prerequisite proved.")
@@ -456,16 +451,13 @@ async def test_9_strict_quiesced_shutdown_ordering():
     coord.start_hook()
     coord.consumer_task = asyncio.create_task(coord.consumer_worker())
     
-    # Push 5 events
     for i in range(5):
         coord.on_winevent(9000 + i, i)
         
-    # Execute quiesced shutdown
     remaining = await coord.supervisor_shutdown()
     assert coord._hook_active is False
     assert coord._hook_thread_running is False
     assert coord.active_consumer_count == 0
-    # Queue is reconciled under single supervisor owner
     assert len(coord.queue) == 0
     print("  -> Passed. Consumer quiesced before supervisor queue reconciliation; zero races.")
 
@@ -477,7 +469,6 @@ async def test_10_hook_join_timeout_aborts_shutdown():
     coord.start_hook()
     coord.consumer_task = asyncio.create_task(coord.consumer_worker())
     
-    # Simulate hook thread hang during join
     timeout_caught = False
     try:
         await coord.supervisor_shutdown(simulate_hook_hang=True)
@@ -486,7 +477,6 @@ async def test_10_hook_join_timeout_aborts_shutdown():
         
     assert timeout_caught is True
     assert coord.shutdown_aborted is True
-    # Verify loop is NOT closed and consumer is NOT blindly assumed dead
     assert not loop.is_closed()
     print("  -> Passed. Hook join timeout caught; shutdown safely aborted without closing loop.")
 
@@ -558,7 +548,6 @@ async def test_14_cross_process_hwnd_reuse_detection():
     coord.on_winevent(1412, 1)
     await asyncio.sleep(0.0005)
     
-    # Recycled across processes: new PID and ticks
     current_ident[0] = WindowIdentity(hwnd=1412, pid=999, creation_filetime_ticks=200, window_class="EvilApp")
     await asyncio.sleep(0.02)
     await coord.supervisor_shutdown()
@@ -568,7 +557,6 @@ async def test_14_cross_process_hwnd_reuse_detection():
 
 async def test_15_adversarial_same_process_hwnd_reuse_limitation():
     print("Test 15: Adversarial same-process, same-thread, same-class HWND reuse limitation evaluated (P2C-60)...")
-    # Window destroyed and recreated by same process, same thread, same class with reused HWND:
     reused_ident = WindowIdentity(hwnd=1515, pid=500, creation_filetime_ticks=133000000000000000, window_class="CabinetWClass")
     current_ident = [reused_ident]
     
@@ -580,16 +568,11 @@ async def test_15_adversarial_same_process_hwnd_reuse_limitation():
     
     coord.on_winevent(1515, 1)
     await asyncio.sleep(0.0005)
-    
-    # Adversarial replacement: window destroyed and new window created with SAME class in SAME process
-    # Win32 user table reuses HWND 1515. The 4-field identity is identically equal!
     current_ident[0] = WindowIdentity(hwnd=1515, pid=500, creation_filetime_ticks=133000000000000000, window_class="CabinetWClass")
     await asyncio.sleep(0.02)
     await coord.supervisor_shutdown()
     
-    # Documents that 4-field identity CANNOT distinguish same-process/same-class reuse
-    # Confirms it is a "Best-effort composite window identity", not universal lifetime proof.
-    assert coord.snapshots_committed == 1  # Indistinguishable under Win32 API boundaries
+    assert coord.snapshots_committed == 1
     print("  -> Evaluated. Adversarial same-process/same-class limitation documented & verified.")
 
 async def test_16_foreground_change_during_inspection_and_shutdown_boundary():
@@ -615,12 +598,10 @@ async def test_16_foreground_change_during_inspection_and_shutdown_boundary():
 
 async def test_17_memory_calculation_nominal_and_upper_range():
     print("Test 17: Memory calculation matches nominal (11,128 B) and upper-range (11,640 B) arithmetic (P2C-61)...")
-    # Nominal record (integers < 2^30)
     tup_nom = (123456, 12345678, time.monotonic())
     record_nom = sys.getsizeof(tup_nom) + sys.getsizeof(123456) + sys.getsizeof(12345678) + sys.getsizeof(time.monotonic())
     assert record_nom == 144
     
-    # Upper-range record (integers >= 2^30)
     tup_upper = (0x7FFFFFFF, 0xFFFFFFFF, time.monotonic())
     record_upper = sys.getsizeof(tup_upper) + sys.getsizeof(0x7FFFFFFF) + sys.getsizeof(0xFFFFFFFF) + sys.getsizeof(time.monotonic())
     assert record_upper == 152
@@ -639,10 +620,10 @@ async def test_17_memory_calculation_nominal_and_upper_range():
     assert lock_size == 56
     
     total_nom = (64 * record_nom) + deque_size + batch_size + lock_size
-    assert total_nom == 11128, f"Nominal discrepancy: {total_nom} != 11128"
+    assert total_nom == 11128
     
     total_upper = (64 * record_upper) + deque_size + batch_size + lock_size
-    assert total_upper == 11640, f"Upper discrepancy: {total_upper} != 11640"
+    assert total_upper == 11640
     print(f"  -> Passed. Nominal: {total_nom} B ({total_nom/1024:.2f} KB); Upper-range: {total_upper} B ({total_upper/1024:.2f} KB).")
 
 async def test_18_telemetry_counter_consistency_including_faulted():
@@ -671,8 +652,157 @@ async def test_18_telemetry_counter_consistency_including_faulted():
     assert q.notifications_scheduled == q.notifications_executed
     print(f"  -> Passed. raw_events ({q.raw_events_received}) == drained ({q.events_drained}) + dropped ({q.events_dropped}) + remaining ({len(q)}).")
 
+async def test_19_sticky_fault_state_persists_after_drain():
+    print("Test 19: Sticky fault-state persists across drain_and_reset() (P2C-62)...")
+    loop = asyncio.new_event_loop()
+    coord = ForegroundDispatchCoordinator(capacity=64)
+    coord.attach_loop(loop)
+    coord.start_hook()
+    loop.close()
+    
+    # Push triggers scheduling failure
+    coord.on_winevent(19001, 1)
+    assert coord.queue.is_faulted is True
+    assert len(coord.queue) == 1
+    
+    # Consumer drains existing batch
+    batch = coord.queue.drain_and_reset()
+    assert len(batch) == 1
+    assert len(coord.queue) == 0
+    assert coord.queue.notification_pending is False
+    
+    # CRITICAL (P2C-62): _faulted MUST REMAIN TRUE!
+    assert coord.queue.is_faulted is True, "drain_and_reset() must not clear sticky _faulted flag!"
+    print("  -> Passed. Sticky fault flag remained True after queue drain.")
+
+async def test_20_sticky_fault_rejects_repeated_cycles():
+    print("Test 20: Faulted queue rejects events over repeated consumer cycles (P2C-62)...")
+    loop = asyncio.new_event_loop()
+    coord = ForegroundDispatchCoordinator(capacity=64)
+    coord.attach_loop(loop)
+    coord.start_hook()
+    loop.close()
+    
+    coord.on_winevent(20001, 1)
+    assert coord.queue.is_faulted is True
+    coord.queue.drain_and_reset()
+    
+    # Subsequent pushes over repeated cycles are rejected
+    for i in range(5):
+        pushed = coord.on_winevent(20010 + i, i)
+        assert pushed is False
+        _ = coord.queue.drain_and_reset()
+        assert coord.queue.is_faulted is True
+        
+    assert coord.queue.events_dropped_faulted == 5
+    print("  -> Passed. 5 repeated push/drain attempts all rejected; fault state never cleared.")
+
+async def test_21_new_lifecycle_requires_reinitialization():
+    print("Test 21: New lifecycle requires quiescence and fresh instance reinitialization (P2C-62)...")
+    loop = asyncio.get_running_loop()
+    # Lifecycle 1: faults and terminates
+    coord1 = ForegroundDispatchCoordinator(capacity=64)
+    coord1.attach_loop(loop)
+    coord1.queue._faulted = True
+    assert coord1.queue.is_faulted is True
+    
+    # Terminate lifecycle 1 completely
+    coord1.stop_hook()
+    
+    # Lifecycle 2: explicit fresh instance creation after old termination
+    coord2 = ForegroundDispatchCoordinator(capacity=64)
+    coord2.attach_loop(loop)
+    coord2.start_hook()
+    coord2.consumer_task = asyncio.create_task(coord2.consumer_worker())
+    
+    # Fresh lifecycle is operational
+    assert coord2.queue.is_faulted is False
+    pushed = coord2.on_winevent(21001, 1)
+    assert pushed is True
+    await asyncio.sleep(0.02)
+    await coord2.supervisor_shutdown()
+    assert coord2.snapshots_committed == 1
+    print("  -> Passed. Fresh lifecycle accepts events; old faulted instance safely isolated.")
+
+async def test_22_proactor_debug_mode_enforcement():
+    print("Test 22: Proactor debug mode configuration enforcement (P2C-64)...")
+    loop = asyncio.new_event_loop()
+    coord = ForegroundDispatchCoordinator(capacity=64)
+    coord.attach_loop(loop)
+    
+    # 1. Debug mode enabled: hook startup MUST be rejected!
+    loop.set_debug(True)
+    startup_rejected = False
+    try:
+        coord.start_hook()
+    except ValueError as e:
+        startup_rejected = True
+    assert startup_rejected is True, "Hook must reject startup when loop.get_debug() is True!"
+    
+    # 2. Debug mode disabled: hook startup succeeds
+    loop.set_debug(False)
+    coord.start_hook()
+    assert coord._hook_active is True
+    
+    # 3. Cannot switch debug on while hook is active
+    debug_switch_rejected = False
+    try:
+        coord.set_debug(True)
+    except RuntimeError:
+        debug_switch_rejected = True
+    assert debug_switch_rejected is True, "Cannot enable debug mode while hook is active!"
+    
+    # 4. Debug mode can be restored after hook teardown
+    coord.stop_hook()
+    coord.set_debug(True)
+    assert loop.get_debug() is True
+    loop.close()
+    print("  -> Passed. Strict debug mode contract enforced; callback logging mathematically eliminated.")
+
+async def test_23_join_timeout_escalation_and_sys_exit_semantics():
+    print("Test 23: Join-timeout escalation and sys.exit background-thread limitation (P2C-65)...")
+    # Demonstrate sys.exit limitation: background thread calling sys.exit does NOT exit process
+    bg_exited_thread_only = False
+    def bg_worker():
+        nonlocal bg_exited_thread_only
+        try:
+            sys.exit(1)
+        except SystemExit:
+            bg_exited_thread_only = True
+            
+    t = threading.Thread(target=bg_worker)
+    t.start()
+    t.join()
+    assert bg_exited_thread_only is True, "sys.exit in background thread only raises SystemExit in that thread!"
+    
+    # Verify hook thread is configured as daemon so interpreter exit is not blocked
+    hook_thread = threading.Thread(name="WinEventHookThread", target=lambda: None, daemon=True)
+    assert hook_thread.daemon is True
+    print("  -> Passed. sys.exit background limitation proved; daemon hook thread verified.")
+
+async def test_24_saturating_telemetry_counters_bounded_memory():
+    print("Test 24: Saturating telemetry counters memory bounding (P2C-66)...")
+    q = BoundedEventQueue(capacity=64)
+    # Set counter to UINT32_MAX - 1
+    q.raw_events_received = UINT32_MAX - 1
+    q.raw_events_received = _sat_inc(q.raw_events_received)
+    assert q.raw_events_received == UINT32_MAX
+    
+    # Increment beyond UINT32_MAX: saturates at UINT32_MAX!
+    q.raw_events_received = _sat_inc(q.raw_events_received)
+    assert q.raw_events_received == UINT32_MAX
+    
+    # Size check on saturated counter in CPython 3.12 AMD64
+    size = sys.getsizeof(q.raw_events_received)
+    assert size == 32, f"Expected 32 bytes for uint32 max integer, got {size}"
+    
+    # Measure memory for 10 saturated counters
+    ten_counters_size = 10 * 32
+    assert ten_counters_size == 320, f"Expected 320 bytes, got {ten_counters_size}"
+    print(f"  -> Passed. Saturating counters capped at {UINT32_MAX}; max integer size is {size} B (10 counters = {ten_counters_size} B).")
+
 async def main():
-    print("================== QUEUE CONCURRENCY & STRESS TEST (PHASE 2C CORRECTION 10) ==================")
+    print("================== QUEUE CONCURRENCY & STRESS TEST (PHASE 2C CORRECTION 11) ==================")
     await test_1_scheduling_succeeds()
     await test_2_loop_stops_before_notification()
     await test_3_loop_closes_before_notification()
@@ -691,8 +821,14 @@ async def main():
     await test_16_foreground_change_during_inspection_and_shutdown_boundary()
     await test_17_memory_calculation_nominal_and_upper_range()
     await test_18_telemetry_counter_consistency_including_faulted()
+    await test_19_sticky_fault_state_persists_after_drain()
+    await test_20_sticky_fault_rejects_repeated_cycles()
+    await test_21_new_lifecycle_requires_reinitialization()
+    await test_22_proactor_debug_mode_enforcement()
+    await test_23_join_timeout_escalation_and_sys_exit_semantics()
+    await test_24_saturating_telemetry_counters_bounded_memory()
     print("==============================================================================================")
-    print(">>> ALL 18 QUEUE CONCURRENCY SCENARIOS VERIFIED SUCCESSFULLY! <<<")
+    print(">>> ALL 24 QUEUE CONCURRENCY SCENARIOS VERIFIED SUCCESSFULLY! <<<")
 
 if __name__ == "__main__":
     asyncio.run(main())

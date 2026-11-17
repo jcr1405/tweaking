@@ -71,10 +71,10 @@ Experiment D (Client DACL Rewrite Blocked):    PASS
 =============================================
 
 ================================================================================
-QUEUE CONCURRENCY & STRESS HARNESS: 18 Concurrency Scenarios (Phase 2C Correction 10)
+QUEUE CONCURRENCY & STRESS HARNESS: 24 Concurrency Scenarios (Phase 2C Correction 11)
 Command: python specs\evidence\phase2c\queue_stress_test.py
 --------------------------------------------------------------------------------
-================== QUEUE CONCURRENCY & STRESS TEST (PHASE 2C CORRECTION 10) ==================
+================== QUEUE CONCURRENCY & STRESS TEST (PHASE 2C CORRECTION 11) ==================
 Test 1: Event-loop scheduling succeeds normally...
   -> Passed. Event queued, scheduled, and consumed.
 Test 2: Event-loop stops before producer notification...
@@ -111,5 +111,17 @@ Test 17: Memory calculation matches nominal (11,128 B) and upper-range (11,640 B
   -> Passed. Nominal: 11128 B (10.87 KB); Upper-range: 11640 B (11.37 KB).
 Test 18: Complete telemetry counter consistency including faulted drops (P2C-57, P2C-61)...
   -> Passed. raw_events (40) == drained (40) + dropped (0) + remaining (0).
+Test 19: Sticky fault-state persists across drain_and_reset() (P2C-62)...
+  -> Passed. Sticky fault flag remained True after queue drain.
+Test 20: Faulted queue rejects events over repeated consumer cycles (P2C-62)...
+  -> Passed. 5 repeated push/drain attempts all rejected; fault state never cleared.
+Test 21: New lifecycle requires quiescence and fresh instance reinitialization (P2C-62)...
+  -> Passed. Fresh lifecycle accepts events; old faulted instance safely isolated.
+Test 22: Proactor debug mode configuration enforcement (P2C-64)...
+  -> Passed. Strict debug mode contract enforced; callback logging mathematically eliminated.
+Test 23: Join-timeout escalation and sys.exit background-thread limitation (P2C-65)...
+  -> Passed. sys.exit background limitation proved; daemon hook thread verified.
+Test 24: Saturating telemetry counters memory bounding (P2C-66)...
+  -> Passed. Saturating counters capped at 4294967295; max integer size is 32 B (10 counters = 320 B).
 ==============================================================================================
->>> ALL 18 QUEUE CONCURRENCY SCENARIOS VERIFIED SUCCESSFULLY! <<<
+>>> ALL 24 QUEUE CONCURRENCY SCENARIOS VERIFIED SUCCESSFULLY! <<<

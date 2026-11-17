@@ -248,7 +248,7 @@ In accordance with Presence engineering principles, mature open-source projects,
      - Contention policy: if consumer holds lock during batch drain, producer try-lock immediately returns False without blocking the Win32 message pump, incrementing `events_dropped_contention`.
      - Faulted policy (P2C-57): when `_faulted == True`, producer immediately rejects incoming events, incrementing `events_dropped_faulted`.
      - Capacity policy: when queue reaches 64 items, newest incoming event is dropped, incrementing `events_dropped_capacity`.
-     - Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False`, `_faulted = False`, and batch-drains the deque.
+     - Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False`, preserves sticky `_faulted = True` (P2C-62), and batch-drains the deque.
   4. **CPython 3.12.7 Proactor AsyncIO Internals & Error Suppression (P2C-37, P2C-39, P2C-44, P2C-48, P2C-49, P2C-54, P2C-55, P2C-56, P2C-58)**:
      - CPython 3.12.7 source audit: `call_soon_threadsafe()` appends to `_ready` directly under GIL. Self-pipe wake-up `_write_to_self()` in `BaseProactorEventLoop` (`proactor_events.py`) writes to `_csock.send(b'\0')`, guards against `None`, and swallows `OSError`. Thread-safe scheduling without hard real-time bounds.
      - Proactor close race (P2C-56): Proved that `call_soon_threadsafe()` can return successfully after the self-pipe is closed, only for `super().close()` to wipe callbacks. Native hook termination is therefore a mandatory prerequisite before stopping/closing the loop.
@@ -311,10 +311,10 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
 | **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004 (isolated DACL test verified); fullmatch validation; session key reserved/deferred |
-| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Unified non-blocking monitor (capacity 64); zero secondary locks; zero callback logging; faulted drop accounting; no-reader-lock protocol; failure atomicity; best-effort composite WindowIdentity; quiesced shutdown ordering & timeout abort; single consumer worker (`<= 1`); owner unhooks |
+| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Unified non-blocking monitor (capacity 64); zero secondary locks; zero callback logging; sticky fault lifecycle; saturating counters (<16 KB lifetime); debug-mode invariant; best-effort composite WindowIdentity; quiesced shutdown & os._exit escalation; single consumer worker (`<= 1`); owner unhooks |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 55.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 56.

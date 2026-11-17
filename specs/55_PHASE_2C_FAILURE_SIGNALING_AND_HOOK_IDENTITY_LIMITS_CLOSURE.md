@@ -222,7 +222,7 @@ When `_faulted` transitions to `True`, the queue enters a strict fail-closed rej
 2. **Explicit Accounting**: Rejected events are counted under `events_dropped_faulted`, keeping drop categories mutually exclusive (`contention`, `capacity`, `faulted`).
 3. **Capacity Bounded**: Usable capacity remains strictly 64 items; existing unread entries are retained intact.
 4. **Single-Lock Coordination**: Fault checking occurs under the existing monitor try-lock; no secondary locks are introduced.
-5. **Atomic Reconciliation**: `_faulted` is reset to `False` if and only if `_notification_pending` is reset to `False` and the queue is drained in `drain_and_reset()`.
+5. **Sticky Fault-State Lifecycle (P2C-62)**: `_faulted` is a monotonic one-way latch; `drain_and_reset()` resets `_notification_pending = False`, but does **NOT** clear `_faulted`. Only an explicit new queue instance reinitialization after lifecycle termination clears the fault state.
 
 ### 5.2 Authoritative Queue Implementation
 ```python
@@ -295,7 +295,7 @@ class BoundedEventQueue:
             batch = list(self._deque)
             self._deque.clear()
             self._notification_pending = False
-            self._faulted = False
+            # P2C-62: _faulted is STICKY; preserved across drain_and_reset()!
             self.events_drained += len(batch)
             return batch
 ```
@@ -387,7 +387,7 @@ If the supervisor blindly continued to stop or close the event loop, late WinEve
    - The event loop is **NOT stopped and NOT closed**; it remains open to absorb any late callbacks safely.
    - The supervisor marks the subsystem in `HOOK_TEARDOWN_TIMEOUT` fault state.
    - Raises `HookShutdownTimeoutError("Hook thread termination timed out. Shutdown aborted.")`.
-3. **Process Escalation**: The process lifecycle supervisor logs critical diagnostic evidence (hook thread TID, hook handle) and escalates to a controlled process termination (`sys.exit(1)` or `TerminateProcess`), failing closed safely.
+3. **Process Escalation**: The process lifecycle supervisor logs critical diagnostic evidence (hook thread TID, hook handle) and escalates to a controlled process termination (`os._exit(1)` or Win32 `ExitProcess(1)`), failing closed safely.
 
 ---
 

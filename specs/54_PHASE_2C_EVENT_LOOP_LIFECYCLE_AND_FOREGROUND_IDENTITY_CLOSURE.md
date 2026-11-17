@@ -150,7 +150,7 @@ The runtime establishes a formal state machine and failure protocol:
    The lifecycle supervisor observes the failure or initiates controlled shutdown:
    - Stops incoming hook callbacks (`UnhookWinEvent`).
    - Drains remaining queue entries via `drain_and_reset()` under `_lock`.
-   - Atomically clears entries and resets `_notification_pending = False` and `_faulted = False`.
+   - Atomically clears entries and resets `_notification_pending = False`, preserving sticky `_faulted = True` (P2C-62; cleared only via fresh instance).
 
 ```python
 def handle_scheduling_failure(self) -> None:

@@ -238,42 +238,61 @@ Out-of-context hook callbacks can be reentered if message pumping occurs during 
 To establish a strictly bounded, reliable pipeline under CPython:
 1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate complex objects, make COM calls, or perform disk I/O.
 2. **Reentrancy Guard**: An atomic reentrancy flag (`_in_callback`) drops nested callback invocations immediately.
-3. **CPython GIL & Latency Classification (P2C-37, P2C-39, P2C-44)**:
+3. **CPython GIL, Event-Loop Internals & Latency Classification (P2C-37, P2C-39, P2C-44, P2C-48)**:
    The Win32 `WinEventProc` callback is invoked from an OS thread via ctypes. Entering Python requires acquiring the CPython GIL (`PyGILState_Ensure`). To eliminate ambiguity, the runtime distinguishes five distinct execution layers:
    - **Application-Level Lock Waits**: Strictly **zero**. The callback executes non-blocking try-locks (`acquire(blocking=False)`); it never waits for locks held by consumer tasks.
    - **Callback-Body Execution**: Pure algorithmic in-memory operations ($O(1)$ deque append and flag check); zero COM, disk, socket, or external process I/O.
-   - **CPython GIL Acquisition**: Under multi-threaded CPU load, acquiring the GIL may experience scheduling latency governed by `sys.getswitchinterval()` (default 5 ms). Crucially, this interval is an ideal evaluation timeslice, not a guaranteed real-time upper bound.
+   - **CPython GIL Acquisition**: Under multi-threaded CPU load, acquiring the GIL may experience scheduling latency governed by `sys.getswitchinterval()` (default 5 ms). Crucially, this interval is an ideal evaluation timeslice within the evaluation loop, not a guaranteed real-time upper bound on OS thread scheduling.
    - **OS Thread Scheduling**: Windows thread quantum and priority scheduling between the hook thread and background processes.
    - **Native Win32 Delivery**: User32 message-queue dispatch via `GetMessageW` / `DispatchMessageW`.
    Presence avoids false claims of "lock-free" or numerical real-time latency bounds (e.g., `<50 μs` or `0.2–0.5 μs`). Instead, it guarantees **zero application-level blocking waits** and deterministic recovery.
 
-4. **Bounded Queue & Unified Notification Monitor (P2C-35, P2C-39, P2C-41, P2C-42)**:
+4. **Bounded Queue & Unified Monitor Ownership (P2C-35, P2C-39, P2C-41, P2C-42, P2C-51)**:
    - A single monitor (`_lock`) synchronizes both the ring deque and notification state, eliminating secondary blocking locks (`_state_lock` is eliminated).
    - Usable capacity is exactly **64 entries**.
    - **Strict Non-Blocking Try-Lock**: Producer calls `_lock.acquire(blocking=False)`. If the consumer is draining, the producer immediately increments `events_dropped_contention` and returns without blocking.
    - **Capacity Overflow**: If the queue reaches 64 entries, the incoming event is discarded, and `events_dropped_capacity` is incremented.
-   - **Zero Stranded Events**: Deque draining and `_notification_pending = False` reset occur atomically in `drain_and_reset()`. It is impossible for an event to reside in the queue without a pending or active consumer cycle.
+   - **Zero Stranded Events**: Deque draining and `_notification_pending = False` reset occur atomically in `drain_and_reset()`.
+   - **Monitor Ownership Rules (P2C-51)**: Lock acquisition is strictly restricted to producer `push()` and consumer `drain_and_reset()`. External diagnostic readers (`notification_pending`, `len(queue)`, telemetry counters) read attributes directly without acquiring `_lock`. This ensures diagnostic reads never cause contention drops for the producer.
 
-5. **Single-Pending Notification Invariant & Signalling (P2C-40, P2C-43)**:
+5. **Single-Pending Notification & Event-Loop Signalling (P2C-40, P2C-43, P2C-48, P2C-49)**:
    - Invariants: `pending_notification_count <= 1`, `active_foreground_consumer_count <= 1`, and `queue_depth <= 64` at all times.
    - When an event is pushed: if `_notification_pending` is False, it is set to True, and `loop.call_soon_threadsafe(event_available.set)` is scheduled once. If True, `events_coalesced` is incremented without redundant scheduling.
+   - **CPython 3.12.7 AsyncIO Internals (P2C-48)**: In CPython 3.12.7 (`asyncio/base_events.py` and `asyncio/windows_events.py`), `call_soon_threadsafe` does not acquire an internal asyncio lock. It appends the handle to `self._ready` (thread-safe under GIL serialization) and calls `_write_to_self()` (a non-blocking loopback socket write to `self._csock.send(b'\0')` on Windows).
+   - **Failure Handling Atomicity (P2C-49)**: If `call_soon_threadsafe` fails (e.g., `RuntimeError` on closed loop), the system enters a controlled fault state (`_faulted = True`). Crucially, the system **NEVER resets `_notification_pending = False` while unread entries remain in the queue**, strictly preserving the invariant:
+     $$\_notification\_pending == \text{False} \implies \text{queue\_depth} == 0$$
 
-6. **Memory Footprint & Complexity (P2C-46)**:
+6. **Exact Memory Footprint & Complexity (P2C-46, P2C-53)**:
    - Push: $O(1)$ amortized and worst-case.
    - Drain: $O(n)$ strictly bounded by $O(\text{capacity} = 64)$ items.
-   - Peak heap memory of queue data structures in Python 3.12 AMD64 is estimated at $\approx 11.1 \ \text{KB}$ ($< 12 \ \text{KB}$), comprising 64 $\times$ 144-byte 3-tuples (9,216 bytes), deque overhead (1,288 bytes), batch list (568 bytes), and lock/instance overhead (100 bytes). This queue estimate is strictly distinguished from total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
+   - Peak heap memory of queue data structures in Python 3.12.7 AMD64 is verified at exactly:
+     $$64 \times 144 \text{ B (records)} + 1,288 \text{ B (deque)} + 568 \text{ B (batch)} + 56 \text{ B (lock)} = \mathbf{11,128 \text{ bytes}} \quad (10.87 \ \text{KB})$$
+     Including instance attribute dict (~152 bytes), total queue overhead is $\approx 11.4 \ \text{KB}$ ($< 12 \ \text{KB}$). This queue estimate is strictly distinguished from the total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
 
-7. **Foreground Snapshot Freshness Contract (P2C-47)**:
+7. **Composite WindowIdentity Freshness Contract (P2C-47, P2C-52)**:
    - The queue is a bounded trigger mechanism. On every wake, the consumer executes a mandatory authoritative live state refresh via User32 `GetForegroundWindow()`.
-   - To prevent committing stale metadata if focus shifts during metadata extraction, the consumer enforces a **Post-Collection Freshness Check**: it validates `hwnd_final == hwnd_initial` and `IsWindow(hwnd_initial)`. If focus changed, the stale snapshot is aborted (`stale_snapshots_aborted += 1`), preserving the single-active-snapshot architecture.
+   - To prevent committing stale metadata due to window focus changes or **HWND recycling attacks**, the consumer validates the complete composite `WindowIdentity`:
+     * `hwnd`
+     * `pid`
+     * `process_creation_filetime_ticks`
+     * `window_class`
+   - If any of these fields change between pre-inspection and post-inspection, the snapshot is rejected as stale (`stale_snapshots_aborted += 1`), preserving the single-active-snapshot architecture.
 
 ```python
+@dataclass(frozen=True)
+class WindowIdentity:
+    hwnd: int
+    pid: int
+    creation_filetime_ticks: int
+    window_class: str
+
 class BoundedEventQueue:
     def __init__(self, capacity: int = 64):
         self.capacity = capacity
         self._lock = threading.Lock()
         self._deque = collections.deque(maxlen=capacity)
         self._notification_pending = False
+        self._faulted = False
         self.events_dropped_capacity = 0
         self.events_dropped_contention = 0
         self.events_coalesced = 0
@@ -282,6 +301,7 @@ class BoundedEventQueue:
         self.queue_high_water_mark = 0
         self.notifications_scheduled = 0
         self.notifications_executed = 0
+        self.scheduling_failures = 0
 
     @property
     def events_dropped(self) -> int:
@@ -289,16 +309,19 @@ class BoundedEventQueue:
 
     @property
     def notification_pending(self) -> bool:
-        with self._lock:
-            return self._notification_pending
+        # Atomic read without acquiring _lock (P2C-51)
+        return self._notification_pending
 
     def push(self, event: tuple) -> tuple[bool, bool]:
         """
         Producer: attempts non-blocking append.
         Returns: (pushed: bool, schedule_signal: bool)
-        Zero application-level lock wait: returns False immediately on contention or overflow.
         """
         self.raw_events_received += 1
+        if self._faulted:
+            self.events_dropped_contention += 1
+            return False, False
+            
         if not self._lock.acquire(blocking=False):
             self.events_dropped_contention += 1
             return False, False
@@ -319,19 +342,24 @@ class BoundedEventQueue:
         finally:
             self._lock.release()
 
+    def handle_scheduling_failure(self):
+        """Preserves invariant: never resets notification_pending=False while unread items exist."""
+        self.scheduling_failures += 1
+        self._faulted = True
+
     def drain_and_reset(self) -> list:
-        """
-        Consumer: atomically drains queue and resets notification flag.
-        Complexity: O(n) bounded by O(capacity = 64).
-        """
+        """Consumer / Shutdown: batch drains queue and resets notification flag."""
         with self._lock:
-            self._notification_pending = False
-            if not self._deque:
-                return []
             batch = list(self._deque)
             self._deque.clear()
+            self._notification_pending = False
+            self._faulted = False
             self.events_drained += len(batch)
             return batch
+
+    def __len__(self) -> int:
+        # Atomic read without acquiring _lock (P2C-51)
+        return len(self._deque)
 
 def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventThread, dwmsEventTime):
     if event != 0x0003 or not hwnd or idObject != 0:
@@ -343,60 +371,65 @@ def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventT
     try:
         now_mono = time.monotonic()
         pushed, schedule_signal = state.queue.push((hwnd, dwmsEventTime, now_mono))
-        if schedule_signal and state.loop and not state.loop.is_closed():
+        if schedule_signal:
+            if state.loop is None or state.loop.is_closed():
+                state.queue.handle_scheduling_failure()
+                return
             try:
                 state.loop.call_soon_threadsafe(state.signal_event_available)
             except RuntimeError:
-                if state.queue._lock.acquire(blocking=False):
-                    try:
-                        state.queue._notification_pending = False
-                    finally:
-                        state.queue._lock.release()
+                state.queue.handle_scheduling_failure()
     finally:
         state.in_callback = False
 ```
 
-### 6.3 Supervised Single-Consumer Worker Lifecycle & Freshness Contract (P2C-33, P2C-47)
+### 6.3 Supervised Single-Consumer Worker Lifecycle & Freshness Contract (P2C-33, P2C-47, P2C-52)
 To guarantee that active asynchronous processing tasks remain strictly bounded ($O(1)$) and prevent task accumulation during slow coroutine execution, the runtime maintains exactly one supervised consumer worker task:
 
 $$\text{active\_foreground\_consumer\_count} \le 1, \quad \text{pending\_notification\_count} \le 1, \quad \text{queue\_depth} \le 64 \quad \forall t$$
 
 ```python
 async def _foreground_consumer_worker(self):
-    """Supervised single consumer worker for foreground window events."""
+    """Supervised single consumer worker with Composite WindowIdentity freshness validation."""
     self.active_foreground_consumer_count = 1
     try:
         while not self._stopping:
             await self._event_available.wait()
+            if self._stopping:
+                break
             self._event_available.clear()
             self.queue.notifications_executed += 1
             
             # Atomic batch drain & notification reset
             events = self.queue.drain_and_reset()
             
-            # Mandatory live foreground-state refresh on EVERY consumer wake
-            hwnd_initial = User32.GetForegroundWindow()
+            # Mandatory live state refresh & initial composite identity capture
+            initial_identity = self._capture_window_identity()
             self.authoritative_refreshes += 1
             
-            if not events and not hwnd_initial:
+            if not events and not initial_identity:
                 continue
                 
             # Asynchronous metadata extraction outside synchronization
             try:
-                metadata = await self._inspect_window_metadata(hwnd_initial)
+                metadata = await self._inspect_window_metadata(initial_identity.hwnd)
             except Exception as e:
                 logger.error("Error inspecting window metadata", exc_info=e)
                 continue
                 
-            # Freshness validation check (P2C-47)
-            hwnd_final = User32.GetForegroundWindow()
-            if hwnd_final != hwnd_initial or not User32.IsWindow(hwnd_initial):
-                # Focus changed or window destroyed during inspection: abort stale snapshot!
+            # Composite WindowIdentity freshness check (P2C-52)
+            final_identity = self._capture_window_identity()
+            if (final_identity.hwnd != initial_identity.hwnd or
+                final_identity.pid != initial_identity.pid or
+                final_identity.creation_filetime_ticks != initial_identity.creation_filetime_ticks or
+                final_identity.window_class != initial_identity.window_class or
+                not User32.IsWindow(final_identity.hwnd)):
+                # Focus changed or window recycled during inspection: abort stale snapshot!
                 self.stale_snapshots_aborted += 1
                 continue
                 
             # Commit verified fresh snapshot
-            await self._commit_foreground_snapshot(hwnd_final, metadata, events)
+            await self._commit_foreground_snapshot(final_identity, metadata, events)
     finally:
         self.active_foreground_consumer_count = 0
 ```
@@ -414,6 +447,8 @@ The teardown sequence is strictly owner-controlled:
 7. **Timeout Reality & Verification**:
    - If `thread.is_alive()` is `False`: Clean termination is verified. Pending queue references are cleared.
    - If `thread.is_alive()` is `True`: **DO NOT claim successful cleanup!** Report `HookShutdownTimeoutError` and log diagnostic evidence (thread TID, handle count).
+8. **Strict Hook/Event-Loop Lifecycle Ordering (P2C-50)**:
+   The supervisor strictly guarantees that `UnhookWinEvent` executes and `WinEventHookThread` terminates (`thread.join(timeout=1.0)`) BEFORE the consumer worker is stopped and BEFORE `loop.stop()` or `loop.close()` is invoked. The runtime prohibits stopping or closing the event loop while the native hook can still deliver callbacks.
 
 ---
 

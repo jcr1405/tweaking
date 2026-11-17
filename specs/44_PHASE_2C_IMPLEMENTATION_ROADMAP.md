@@ -73,20 +73,24 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - Implement `ForegroundWindowSource` using `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`.
   - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
   - Implement hook callback reentrancy guard (`_in_callback` flag) and bounded event queuing (`collections.deque(maxlen=64)`).
-  - Implement **Bounded Event Dispatch & Unified Notification Synchronization (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37, P2C-39, P2C-40, P2C-41, P2C-42, P2C-43, P2C-44, P2C-46, P2C-47)**:
+  - Implement **Bounded Event Dispatch & Unified Notification Synchronization (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37, P2C-39, P2C-40, P2C-41, P2C-42, P2C-43, P2C-44, P2C-46, P2C-47, P2C-48, P2C-49, P2C-50, P2C-51, P2C-52, P2C-53)**:
     * Single monitor on `BoundedEventQueue`: synchronizes both the ring deque and notification state, completely eliminating secondary blocking locks (`_state_lock` eliminated).
     * Strictly non-blocking callback: `push()` acquires `_lock.acquire(blocking=False)`. If contended, immediately drops event, increments `events_dropped_contention`, and returns `(False, False)` without blocking the Win32 message pump.
+    * Monitor ownership rules (P2C-51): lock acquisition strictly restricted to `push()` and `drain_and_reset()`. Diagnostic readers (`notification_pending`, `len()`) read attributes directly without acquiring `_lock`, guaranteeing zero reader-induced contention drops.
     * Exact usable capacity: strictly **64 entries**. Overflow drops incoming event and increments `events_dropped_capacity`.
     * Single-pending notification: `push()` sets `_notification_pending = True` only on False->True transition and returns `schedule_signal = True`; otherwise increments `events_coalesced`.
     * Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False` and batch-drains the deque ($O(n)$ bounded by $O(\text{capacity} = 64)$).
-    * Signalling semantics: `loop.call_soon_threadsafe(self._event_available.set)` scheduled at most once per drain cycle. Catches `RuntimeError` on loop closure and resets notification state non-blocking.
+    * CPython 3.12.7 Signalling Semantics (P2C-43, P2C-48): `loop.call_soon_threadsafe(self._event_available.set)` appends to `_ready` directly and executes non-blocking `_write_to_self()` (loopback socket send). Thread-safe scheduling without internal locks; no hard real-time guarantee.
+    * Failure handling atomicity (P2C-49): If scheduling fails, queue transitions to `_faulted = True`, retaining `_notification_pending = True` to preserve the invariant:
+      $$\_notification\_pending == \text{False} \implies \text{queue\_depth} == 0$$
     * CPython GIL & latency reality: Zero application-level blocking lock waits. GIL acquisition latency is governed by `sys.getswitchinterval()` (ideal evaluation timeslice, not a hard real-time ceiling). No unmeasured `<50 μs` or `0.2–0.5 μs` claims.
-    * Memory footprint precision: Queue data structures heap footprint estimated at $\approx 11.1 \ \text{KB}$ ($< 12 \ \text{KB}$ in Python 3.12 AMD64), strictly distinguished from total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
-    * Freshness validation contract (P2C-47): Consumer queries initial `GetForegroundWindow()`, extracts metadata, then performs post-collection check `hwnd_final == hwnd_initial` and `IsWindow(hwnd_initial)`. Stale snapshots resulting from focus shifts during inspection are cleanly aborted (`stale_snapshots_aborted += 1`).
+    * Memory footprint precision (P2C-53): Queue data structures heap footprint verified at exactly $9,216 + 1,288 + 568 + 56 = \mathbf{11,128 \text{ bytes}}$ ($10.87 \ \text{KB}$ in Python 3.12 AMD64), strictly distinguished from total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
+    * Composite WindowIdentity Freshness Contract (P2C-47, P2C-52): Consumer extracts initial composite identity (`HWND`, `PID`, `creation_filetime_ticks`, `window_class`), extracts metadata, then performs post-collection re-validation against all 4 fields. Mid-inspection focus shifts and HWND recycling attacks are cleanly aborted (`stale_snapshots_aborted += 1`).
     * Supervised Single-Consumer Worker: runs a dedicated, persistent worker task with invariant `active_foreground_consumer_count <= 1`.
+    * Strict Lifecycle Ordering (P2C-50): Hook unhooks on owning thread and terminates BEFORE consumer worker stops and loop is stopped/closed.
     * Guaranteed invariants:
       $$\text{pending\_notification\_count} \le 1, \quad \text{active\_foreground\_consumer\_count} \le 1, \quad \text{queue\_depth} \le 64 \quad \forall t$$
-  - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped_capacity`, `events_dropped_contention`, `queue_high_water_mark`, `notifications_scheduled`, `notifications_executed`, `max_event_processing_delay`, `pending_notification_count`, `active_foreground_consumer_count`, `authoritative_refreshes`, `stale_snapshots_aborted`, `snapshots_committed`.
+  - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped_capacity`, `events_dropped_contention`, `queue_high_water_mark`, `notifications_scheduled`, `notifications_executed`, `scheduling_failures`, `max_event_processing_delay`, `pending_notification_count`, `active_foreground_consumer_count`, `authoritative_refreshes`, `stale_snapshots_aborted`, `snapshots_committed`.
   - Retrieve top-level window caption via `GetWindowTextW` (User32 cached caption; no synthetic timeouts).
   - Construct composite `WindowIdentity` (`HWND`, `PID`, `process_creation_filetime_ticks: int`, `window_class`).
   - Implement 150 ms event debouncing and duplicate suppression.

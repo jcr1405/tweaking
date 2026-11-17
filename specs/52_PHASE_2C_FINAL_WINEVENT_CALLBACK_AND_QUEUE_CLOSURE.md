@@ -252,9 +252,9 @@ The interaction between the producer thread (`WinEventHookThread`) and consumer 
 - **Analysis**: The first 64 events are stored in `queue`. Events 65 through $N$ return `False` from `push()` and increment `events_dropped_capacity`. The consumer wakes, drains the 64 events, and executes Step 7 (`GetForegroundWindow()`), capturing the final window selected by the user.
 - **Conclusion**: **Safe. Memory strictly bounded; final user state preserved.**
 
-#### Race Condition 6: Event arrives when event loop is closed or closing
-- **Analysis**: Producer calls `queue.push(event)` (succeeds). In Step 3, `loop.call_soon_threadsafe()` catches `RuntimeError: Event loop is closed`, resets `_notification_pending = False`, and exits cleanly without uncaught exceptions or deadlocks.
-- **Conclusion**: **Safe. Clean fail-safe shutdown.**
+#### Race Condition 6: Event arrives when event loop is closed or closing (P2C-49)
+- **Analysis**: Producer calls `queue.push(event)` (succeeds). In Step 3, `loop.call_soon_threadsafe()` catches `RuntimeError: Event loop is closed` or detects closed loop. The queue invokes `handle_scheduling_failure()`, setting `_faulted = True` and preserving `_notification_pending = True` so unread events are not stranded with unnotified status. The lifecycle supervisor drains remaining entries during teardown.
+- **Conclusion**: **Safe. Controlled fault transition; invariant preserved.**
 
 #### Race Condition 7: Consumer worker task is cancelled (`asyncio.CancelledError`)
 - **Analysis**: `consumer_worker()` wraps execution in `try...finally`. In the `finally` block, `self.active_foreground_consumer_count` is decremented to 0. Pending data remains safely in `queue` and can be drained by shutdown cleanup.

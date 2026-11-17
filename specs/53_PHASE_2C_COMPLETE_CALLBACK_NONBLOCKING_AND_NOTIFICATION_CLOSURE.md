@@ -37,8 +37,8 @@ Specification 53 resolves this root cause and provides comprehensive architectur
    Strictly distinguished between **Harness-level experimentally verified** results (queue capacity, lock contention, drop counters, notification state transitions, single-consumer invariants) and **Native integration pending Phase 2C.1** (actual `SetWinEventHook` registration, native hook thread message pump, real `GetForegroundWindow()` User32 queries, and `UnhookWinEvent` thread cleanup). Updated Gate N and Gate O accordingly.
 6. **P2C-46 (Memory Footprint & Complexity Precision)**:
    Confirmed algorithmic complexities: $O(1)$ push, $O(n \le 64)$ drain, $O(1)$ notification. Provided an exact, reproducible byte calculation in Python 3.12 AMD64: total queue data structures heap overhead is **$11,128 \ \text{bytes} \approx 11.1 \ \text{KB}$ ($< 12 \ \text{KB}$)**. Strictly distinguished this queue data structures footprint from the total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
-7. **P2C-47 (Foreground Snapshot Freshness Contract)**:
-   Addressed the hazard where window focus shifts during metadata extraction. Specified a **Post-Collection Freshness Check** (`hwnd_final == hwnd_initial` and `IsWindow(hwnd_initial)`). Stale snapshots resulting from focus shifts during inspection are aborted (`stale_snapshots_aborted += 1`), preserving the single-current-snapshot architecture without an ambient history buffer.
+7. **P2C-47 (Foreground Snapshot Freshness Contract & Composite Identity Expansion)**:
+   Addressed the hazard where window focus shifts during metadata extraction. Specified a **Post-Collection Freshness Check** (`hwnd_final == hwnd_initial` and `IsWindow(hwnd_initial)`), subsequently expanded in P2C-52 / Specification 54 into composite `WindowIdentity` validation (`(hwnd, pid, creation_filetime_ticks, window_class)`). Stale snapshots resulting from focus shifts or HWND recycling during inspection are aborted (`stale_snapshots_aborted += 1`), preserving the single-current-snapshot architecture without an ambient history buffer.
 
 ---
 
@@ -56,7 +56,7 @@ Every operation executed synchronously on the `WinEventHookThread` callback path
 | **6** | Notification state check & transition | `_notification_pending` | Non-blocking application operation | Evaluated under same try-lock as Step 4. **`_state_lock` eliminated**. If `False`, sets `True` and returns `schedule_signal=True`. |
 | **7** | Queue lock release | `BoundedEventQueue._lock.release()` | Non-blocking application operation | Unlocks monitor. |
 | **8** | Event-loop notification signal | `loop.call_soon_threadsafe(event_available.set)` | Runtime / OS scheduling dependency | Invoked only when `schedule_signal=True`. Appends handle to loop `_ready` deque and writes byte to loopback socketpair. Thread-safe; bounded $O(1)$. |
-| **9** | Event-loop closure exception handling | `try...except RuntimeError` | Non-blocking application operation | If loop closed concurrently, catches `RuntimeError`, performs non-blocking `acquire(blocking=False)` to reset `_notification_pending = False`. Zero blocking. |
+| **9** | Event-loop closure exception handling | `try...except RuntimeError` | Non-blocking application operation | If loop closed concurrently, catches `RuntimeError`, marks queue `_faulted = True` and transitions to controlled shutdown. Retains `_notification_pending = True` to preserve invariant. Zero blocking. |
 
 **Audit Conclusion**: All application-level blocking lock acquisitions (`acquire(blocking=True)`) have been eliminated from the callback path.
 
@@ -209,10 +209,11 @@ class BoundedEventQueue:
 - **Consumer**: Wakes from Producer 1's signal and drains both events.
 - **Proof**: **Safe. Exactly one notification scheduled; all events drained.**
 
-#### Scenario 8: Event-loop closure races with producer notification
-- **State**: Event loop is closed while producer calls `call_soon_threadsafe()`.
-- **Action**: `call_soon_threadsafe()` raises `RuntimeError`. Producer catches exception, attempts non-blocking try-lock to reset `_notification_pending = False`, and exits cleanly.
-- **Proof**: **Safe. Clean fail-safe shutdown; zero unhandled exceptions.**
+#### Scenario 8: Event-loop closure races with producer notification (P2C-49)
+- **State**: Event loop is closed or stopped while producer calls `call_soon_threadsafe()`.
+- **Action**: `call_soon_threadsafe()` raises `RuntimeError` or loop is closed. Producer invokes `handle_scheduling_failure()`, marking `_faulted = True` and logging failure. Crucially, `_notification_pending` is **NOT** reset to `False` while unread entries remain in the queue, preserving the invariant:
+  $$\_notification\_pending == \text{False} \implies \text{queue\_depth} == 0$$
+- **Proof**: **Safe. Controlled fault transition; invariant preserved; zero stranded unnotified events.**
 
 #### Scenario 9: Shutdown races with notification-state reset
 - **State**: Runtime requests shutdown. `shutdown_event.set()` and `event_available.set()` are signaled.
@@ -243,15 +244,14 @@ class BoundedEventQueue:
 ### 5.1 Invocation Contract in Python 3.12
 `loop.call_soon_threadsafe(self.event_available.set)` is invoked by the `WinEventHookThread` only when `push()` transitions `_notification_pending` from `False` to `True`.
 
-In CPython 3.12 (`asyncio.base_events.py` and `asyncio.proactor_events.py`):
-1. `call_soon_threadsafe` acquires the event loop's internal lock (`self._lock`) to protect the `_ready` deque.
-2. It wraps the callback in an `asyncio.Handle` and appends it to `self._ready`.
+In CPython 3.12 (`asyncio.base_events.py` and `asyncio.windows_events.py`):
+1. `call_soon_threadsafe` checks `self._check_closed()`. It does not acquire an internal asyncio lock; `self._ready.append(handle)` is serialized under the CPython GIL.
+2. It wraps the callback in an `asyncio.Handle` and appends it directly to `self._ready`.
 3. It calls `self._write_to_self()`: on Windows with `ProactorEventLoop`, this writes a single `b'\0'` byte to a non-blocking loopback `socketpair` (`csock.send()`), unblocking `GetQueuedCompletionStatus` in the loop thread.
 
 ### 5.2 Distinguishing Thread Safety from Hard Real-Time
 `call_soon_threadsafe` is **thread-safe**, but it is **not formally wait-free or hard real-time**:
-- It acquires CPython asyncio internal locks.
-- It performs an OS-level loopback socket write.
+- It performs an OS-level loopback socket write (`csock.send()`).
 - Because `_notification_pending` prevents duplicate scheduling, `self._ready` is guaranteed to contain at most **one** notification callback per drain cycle. Unbounded callback buildup in the event loop is impossible.
 
 ---
@@ -299,8 +299,9 @@ Measurements taken directly in Python 3.12.7 (64-bit AMD64) establish the exact 
 | **Retained Records (Capacity 64)** | 64 event records $\times$ 144 bytes | **9,216 bytes** |
 | **Deque Container (Capacity 64)** | `collections.deque(maxlen=64)` internal block + header | **1,288 bytes** |
 | **Temporary Batch List** | 64 pointers + list object header during `drain_and_reset()` | **568 bytes** |
-| **Lock & Instance State** | `threading.Lock` (56 bytes) + instance attributes | **~100 bytes** |
-| **Total Queue Data Structures Heap Footprint** | $9,216 + 1,288 + 568 + 100 = \mathbf{11,172 \ \text{bytes}}$ | $\mathbf{\approx 11.1 \ \text{KB} \ (< 12 \ \text{KB})}$ |
+| **Lock Primitive** | `threading.Lock` object header and lock state | **56 bytes** |
+| **Core Queue Data Structures Heap Footprint** | $9,216 + 1,288 + 568 + 56 = \mathbf{11,128 \ \text{bytes}}$ | $\mathbf{10.87 \ \text{KB} \ (< 12 \ \text{KB})}$ |
+| **Instance State Dict & Counters (Optional/Heap)** | `BoundedEventQueue.__dict__` overhead (~152 bytes) | **~152 bytes** (Total $\approx 11.4 \ \text{KB}$) |
 
 ### 7.3 Memory Footprint vs Total Process Working Set
 The estimated $\approx 11.1 \ \text{KB}$ footprint covers strictly the Python queue data structures. It is **not** a bound on the process working set:
@@ -319,16 +320,17 @@ If the user switches focus to another window during this retrieval window:
 - If committed blindly, the runtime would publish stale metadata as the "current active window".
 
 ### 8.2 The Freshness Validation Contract
-To maintain absolute context fidelity without introducing an ambient history buffer, the consumer worker executes a **Post-Collection Freshness Check**:
+To maintain absolute context fidelity without introducing an ambient history buffer, the consumer worker executes a **Post-Collection Freshness Check** (expanded in P2C-52 into full composite identity validation):
 
 ```python
-# Supervised Consumer Worker Freshness Protocol
+# Supervised Consumer Worker Freshness Protocol (see Specification 54 for full composite validation)
 hwnd_initial = User32.GetForegroundWindow()
 
 # Extract metadata asynchronously outside locks
 metadata = await self._inspect_window_metadata(hwnd_initial)
 
-# Post-Collection Freshness Check (P2C-47)
+# Post-Collection Freshness Check (P2C-47 / P2C-52)
+# In P2C-52, expanded to compare (hwnd, pid, creation_filetime_ticks, window_class)
 hwnd_final = User32.GetForegroundWindow()
 if hwnd_final != hwnd_initial or not User32.IsWindow(hwnd_initial):
     # Focus shifted or window closed during inspection: abort stale snapshot!
@@ -342,7 +344,7 @@ self.snapshots_committed += 1
 ```
 
 This guarantees:
-1. **Zero Stale Snapshots**: Metadata is committed if and only if the window remains the active foreground window throughout inspection.
+1. **Zero Stale Snapshots**: Metadata is committed if and only if the window remains the active foreground window at the validation point (reinforced in P2C-52 against HWND recycling).
 2. **Preservation of Single-Active-Snapshot Architecture (ADR-2C-03)**: No ambient history ring buffer is recorded or stored.
 
 ---

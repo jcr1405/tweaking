@@ -115,7 +115,7 @@ Presence implements an explicit **Producer-Owned Drop-Newest Policy**:
 2. The incoming event is discarded; `events_dropped` is incremented.
 3. **Live State Recovery**:
    In desktop activity tracking, the system does not require a lossless historical tape of every window focus transition (e.g. holding Alt-Tab switches windows 50 times in 100 ms; intermediate windows are superseded). What matters is the **current active foreground window**.
-   Upon waking, the consumer worker task drains all pending items, takes the latest event (`batch[-1]`), and optionally validates or queries `GetForegroundWindow()` directly from User32.
+   Upon waking, the consumer worker task drains all pending items, takes the latest event (`batch[-1]`), and unconditionally queries `GetForegroundWindow()` directly from User32 (finalized as a mandatory authoritative state refresh in Specification 52).
    Therefore, dropped intermediate events do not compromise desktop context correctness: the live active window is always recovered accurately.
 
 ---

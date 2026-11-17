@@ -238,20 +238,23 @@ Out-of-context hook callbacks can be reentered if message pumping occurs during 
 To establish a strictly bounded, reliable pipeline under CPython:
 1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate complex objects, make COM calls, or perform disk I/O.
 2. **Reentrancy Guard**: An atomic reentrancy flag (`_in_callback`) drops nested callback invocations immediately.
-3. **CPython GIL Reality (P2C-37)**: The Win32 `WinEventProc` callback is invoked from an OS thread via ctypes. Entering Python requires acquiring the CPython GIL (`PyGILState_Ensure`). Under CPU-bound execution on other threads, callback execution may experience microsecond scheduling delays. Presence avoids false claims of "lock-free" or "hard non-blocking" native guarantees. Instead, it guarantees **zero application-level blocking lock waits**, bounded memory, and measurable microsecond execution latency.
-4. **Bounded Python Queue (P2C-35)**:
-   - Uses a strictly bounded queue (`collections.deque(maxlen=64)` protected by an internal `threading.Lock`).
+3. **CPython GIL Reality (P2C-37, P2C-39)**: The Win32 `WinEventProc` callback is invoked from an OS thread via ctypes. Entering Python requires acquiring the CPython GIL (`PyGILState_Ensure`). Under CPU-bound execution on other threads, callback execution may experience microsecond scheduling delays. Presence avoids false claims of "lock-free" or "hard non-blocking" native guarantees. Instead, it guarantees **zero application-level blocking lock waits**, bounded memory, non-blocking try-lock queue operations, and measurable microsecond execution latency without unverified hard real-time claims.
+4. **Bounded Python Queue (P2C-35, P2C-39)**:
+   - Uses a strictly bounded queue (`collections.deque(maxlen=64)` protected by an internal `threading.Lock` accessed via non-blocking try-lock `acquire(blocking=False)`).
    - Usable capacity is exactly **64 entries**.
    - **Strict Ownership**:
-     * **Producer (Hook Thread)** owns appending items, checking capacity, and incrementing `events_dropped`. Producer **never** modifies consumer read pointers.
+     * **Producer (Hook Thread)** owns appending items, checking capacity, and incrementing `events_dropped_capacity` and `events_dropped_contention`. Producer **never** modifies consumer read pointers.
      * **Consumer (Worker Task)** owns draining items in atomic batches and updating processing telemetry. Consumer **never** modifies producer write pointers.
-   - **Overflow Policy**: When the queue reaches capacity (64), incoming events are discarded (dropped), and `events_dropped` is incremented. Because desktop tracking prioritizes the *current active window* over historical intermediate switches, the consumer worker recovers the authoritative live foreground state by querying `GetForegroundWindow()` upon wake-up.
-5. **Single-Pending Wake-Up Coalescing**:
-   - Invariant: `pending_notification_count <= 1` at all times.
+   - **Contention & Overflow Policies**:
+     * If the consumer is actively draining the queue, the producer's try-lock `_lock.acquire(blocking=False)` returns `False`. The event is immediately discarded without blocking the Win32 message pump, and `events_dropped_contention` is incremented.
+     * If the lock is acquired but the queue has reached capacity (64), the incoming event is discarded and `events_dropped_capacity` is incremented.
+     * The queue is a bounded trigger and telemetry mechanism; desktop tracking prioritizes the *current active window*. The consumer worker executes a mandatory, unconditional authoritative live state refresh via User32 `GetForegroundWindow()` on every wake-up, ensuring complete recovery regardless of dropped intermediate events.
+5. **Single-Pending Wake-Up Coalescing & Bounded Task Lifecycle (P2C-40)**:
+   - Invariants: `pending_notification_count <= 1`, `active_foreground_consumer_count <= 1`, and `queue_depth <= 64` at all times.
    - When an event is pushed: if `notification_pending` is `False`, it is set to `True`, and a single wake-up is signaled via `loop.call_soon_threadsafe(event_available.set)`. Subsequent burst events increment `events_coalesced` without scheduling duplicate loop callbacks.
-6. **AsyncIO Consumer Draining**:
-   - The worker task wakes, clears `event_available`, resets `notification_pending = False`, and atomically drains the queue batch.
-   - Intermediate rapid focus flips are collapsed: the worker processes the latest event or validates against live `GetForegroundWindow()`.
+6. **AsyncIO Consumer Draining & Mandatory Live State Refresh**:
+   - The worker task wakes, clears `event_available`, resets `notification_pending = False`, and atomically drains the queue batch ($O(n)$ complexity bounded by $O(\text{capacity} = 64)$ items; memory bounded to $< 8 \ \text{KB}$).
+   - The worker unconditionally queries `GetForegroundWindow()` to capture the authoritative live foreground state, collapsing intermediate rapid focus flips and recovering from any contention or capacity drops.
 
 ```python
 class BoundedEventQueue:
@@ -259,25 +262,41 @@ class BoundedEventQueue:
         self.capacity = capacity
         self._lock = threading.Lock()
         self._deque = collections.deque(maxlen=capacity)
-        self.events_dropped = 0
+        self.events_dropped_capacity = 0
+        self.events_dropped_contention = 0
         self.raw_events_received = 0
         self.events_drained = 0
         self.queue_high_water_mark = 0
 
+    @property
+    def events_dropped(self) -> int:
+        return self.events_dropped_capacity + self.events_dropped_contention
+
     def push(self, event: tuple) -> bool:
-        """Producer: appends event if under capacity (64), drops newest if full."""
-        with self._lock:
-            self.raw_events_received += 1
+        """
+        Producer: attempts non-blocking append.
+        Zero application-level lock wait: returns False immediately on contention or overflow.
+        """
+        self.raw_events_received += 1
+        if not self._lock.acquire(blocking=False):
+            self.events_dropped_contention += 1
+            return False
+        try:
             if len(self._deque) >= self.capacity:
-                self.events_dropped += 1
+                self.events_dropped_capacity += 1
                 return False
             self._deque.append(event)
             if len(self._deque) > self.queue_high_water_mark:
                 self.queue_high_water_mark = len(self._deque)
             return True
+        finally:
+            self._lock.release()
 
     def drain(self) -> list:
-        """Consumer: batch drains all pending events."""
+        """
+        Consumer: batch drains all pending events.
+        Complexity: O(n) bounded by O(capacity = 64).
+        """
         with self._lock:
             if not self._deque:
                 return []
@@ -346,15 +365,19 @@ async def _foreground_consumer_worker(self):
             self._event_available.clear()
             self.notification_pending = False
             
-            # Drain batch from bounded SPSC buffer
-            events = self.ring_buffer.drain()
-            if not events:
+            # Drain batch from bounded queue (O(capacity) atomic batch drain)
+            events = self.queue.drain()
+            
+            # Mandatory live foreground-state refresh on EVERY consumer wake
+            active_hwnd = User32.GetForegroundWindow()
+            self.authoritative_refreshes += 1
+            if not events and not active_hwnd:
                 continue
                 
-            # Coalesce intermediate rapid shifts: process only the latest foreground event
-            latest_event = events[-1]
+            # Coalesce intermediate rapid shifts: process latest event or live foreground state
+            latest_event = events[-1] if events else None
             try:
-                await self._process_foreground_event(latest_event)
+                await self._process_foreground_event(latest_event, active_hwnd=active_hwnd)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -504,7 +527,7 @@ Resource values are explicit **Design Targets & Acceptance Ceilings**, to be emp
 
 Specification 41 is ready for implementation only when all following criteria are satisfied:
 1. **Canonical FILETIME Ticks**: Process creation identity uses exact 64-bit integer tick counts (`process_creation_filetime_ticks`). Datetime conversion uses pure integer arithmetic with documented microsecond truncation; zero float conversion in canonical identity path.
-2. **Reentrancy-Safe Hook & Bounded Coalesced Dispatch**: WinEvent callback is minimal, guarded against reentrancy, and places compact records into a bounded queue (`maxlen=50`). Single-pending-notification mechanism ensures `pending_notification_count <= 1` at all times, preventing unbounded asyncio callback accumulation.
+2. **Reentrancy-Safe Hook & Bounded Coalesced Dispatch**: WinEvent callback is minimal, guarded against reentrancy, and places compact records into a bounded queue (`capacity=64`). Single-pending-notification mechanism ensures `pending_notification_count <= 1` at all times, preventing unbounded asyncio callback accumulation.
 3. **Realistic Resource Expectations**: Absolute claims of zero CPU/wakeups are eliminated; realistic event-driven budgets are defined with standardized soak test experiments and explicit Design Targets vs Acceptance Ceilings.
 4. **Hardened Named Pipe IPC**: VS Code named pipe architecture specifies explicit Logon SID DACL without User SID grant, strictly withholds `FILE_CREATE_PIPE_INSTANCE`, separates `dwOpenMode` from `dwPipeMode`, binds complete handshake transcript into mutual HMAC-SHA256 proofs, and restricts operations to canonical `vscode.*` metadata methods (no `provider.shutdown`).
 5. **Owner-Controlled Unhooking**: Teardown guarantees `UnhookWinEvent` is executed strictly by `WinEventHookThread`. If `thread.join(timeout=1.0)` times out, an incomplete shutdown is reported rather than claiming clean termination.

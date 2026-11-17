@@ -72,18 +72,19 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
 - **Scope**:
   - Implement `ForegroundWindowSource` using `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`.
   - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
-  - Implement hook callback reentrancy guard (`_in_callback` flag) and compact event queuing (`collections.deque(maxlen=50)`).
-  - Implement **Bounded Event Dispatch & Supervised Consumer (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37)**:
+  - Implement hook callback reentrancy guard (`_in_callback` flag) and bounded event queuing (`collections.deque(maxlen=64)`).
+  - Implement **Bounded Event Dispatch & Supervised Consumer (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37, P2C-39, P2C-40)**:
     * Synchronized state flags: `_notification_pending: bool = False`, `_shutdown_requested: bool = False`.
-    * Native callback pushes into a bounded Python queue (`collections.deque(maxlen=64)` protected by an internal lock) with exact usable capacity of **64 entries**.
-    * Strict ownership: Producer appends items and increments `events_dropped` on overflow; consumer drains batches and updates delay telemetry. Neither modifies the other's state pointers.
-    * CPython GIL reality: Win32 hook callback entering Python via ctypes requires acquiring the CPython GIL (`PyGILState_Ensure`). System guarantees zero application-level blocking lock waits and bounded microsecond latency without making unverified "lock-free" claims.
-    * Overflow policy: If the queue is full (64), incoming events are discarded and `events_dropped` is incremented. On wakeup, the consumer queries `GetForegroundWindow()` to recover the live active window state.
+    * Native callback pushes into a bounded Python queue (`collections.deque(maxlen=64)` protected by an internal lock) with exact usable capacity of **64 entries** using non-blocking try-lock (`acquire(blocking=False)`).
+    * Strict ownership: Producer appends items and increments `events_dropped_capacity` on overflow and `events_dropped_contention` on lock contention; consumer drains batches and updates delay telemetry. Neither modifies the other's state pointers.
+    * CPython GIL reality: Win32 hook callback entering Python via ctypes requires acquiring the CPython GIL (`PyGILState_Ensure`). System guarantees zero application-level blocking lock waits and microsecond execution latency without unverified hard real-time claims.
+    * Overflow & contention policies: If the lock is contended by consumer drain, the producer immediately drops the event without blocking and increments `events_dropped_contention`. If the queue is full (64), incoming events are discarded and `events_dropped_capacity` is incremented.
+    * Mandatory authoritative refresh: On every wake, the consumer worker unconditionally queries `GetForegroundWindow()` to recover the live active window state, guaranteeing authoritative consistency despite intermediate drops.
     * Wake-up coalescing: if `_notification_pending` is False, sets `_notification_pending = True`, increments `notification_callbacks_scheduled`, and signals the consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
-    * Supervised Single-Consumer Worker: runs a dedicated, persistent worker task with invariant `active_foreground_consumer_count <= 1`. Worker wakes on `_event_available.wait()`, clears the event, drains the queue, selects the latest relevant foreground event or validates with `GetForegroundWindow()`, and processes it outside synchronization boundaries.
+    * Supervised Single-Consumer Worker: runs a dedicated, persistent worker task with invariant `active_foreground_consumer_count <= 1`. Worker wakes on `_event_available.wait()`, clears the event, drains the queue ($O(n)$ bounded by $O(\text{capacity} = 64)$, memory $< 8 \ \text{KB}$), executes mandatory `GetForegroundWindow()` refresh, and processes outside synchronization boundaries.
     * Guaranteed invariants:
-      $$\text{pending\_notification\_count} \le 1, \quad \text{active\_foreground\_consumer\_count} \le 1 \quad \forall t$$
-  - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped`, `events_overwritten`, `queue_high_water_mark`, `notification_callbacks_scheduled`, `notification_callbacks_executed`, `max_event_processing_delay`, `pending_notification_count`, `active_foreground_consumer_count`, `fallback_events_recorded`, `fallback_events_consumed`, `wakeups_recovered`.
+      $$\text{pending\_notification\_count} \le 1, \quad \text{active\_foreground\_consumer\_count} \le 1, \quad \text{queue\_depth} \le 64 \quad \forall t$$
+  - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped_capacity`, `events_dropped_contention`, `queue_high_water_mark`, `notification_callbacks_scheduled`, `notification_callbacks_executed`, `max_event_processing_delay`, `pending_notification_count`, `active_foreground_consumer_count`, `authoritative_refreshes`.
   - Retrieve top-level window caption via `GetWindowTextW` (User32 cached caption; no synthetic timeouts).
   - Construct composite `WindowIdentity` (`HWND`, `PID`, `process_creation_filetime_ticks: int`, `window_class`).
   - Implement 150 ms event debouncing and duplicate suppression.

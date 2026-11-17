@@ -595,24 +595,25 @@ _counters = {
 
 ---
 
-## 14. Cross-Specification Consistency Matrix (Specs 41 through 50)
+## 14. Cross-Specification Consistency Matrix (Specs 41 through 51)
 
-| Architectural Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Status |
-|---|---|---|---|---|---|---|---|---|---|---|:---:|
-| **Named Pipe DACL SDDL** | `D:P(A;;RC;;;OW)...` | `(A;;RC;;;OW)` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10 | Sec 5 | Sec 4 | Sec 3-5 | **CONSISTENT** |
-| **Owner Rights Restriction** | Restricted to `RC` | `OW` restricted | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10.3 | Sec 5.2 | Sec 4.4 | Sec 5 | **CONSISTENT** |
-| **Client Access Mask & libuv** | `0x0012019B` | `0x0012019B` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.32 | Sec 10.4 | Sec 5.3 | Sec 6 | Sec 3-6 | **CONSISTENT** |
-| **Pipe Flags & Parameter Separation** | `0x40080003` / `0x0008` | Fail-closed | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 5 | Sec 3 | **CONSISTENT** |
-| **Race-Free WinEvent SPSC Buffer** | SPSC maxlen 64 | Non-blocking | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.29, 5.33 | Sec 22.2 | Sec 8.2 | Sec 7 | Sec 7-8 | **CONSISTENT** |
-| **Supervised Consumer & Coalescing** | `active <= 1`, `pending <= 1` | Bounded queue | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.24, 5.33 | Sec 23.1 | Sec 8.2 | Sec 7.4 | Sec 9 | **CONSISTENT** |
-| **Hook Teardown Lifecycle** | Owner unhook | Timeout error | N/A | Exp F join | ADR-2C-13 | Sec 5.25 | Sec 21.2 | Sec 9 | Sec 8 (Scen 8) | Sec 7 | **CONSISTENT** |
-| **Handshake Transcript Wire Format** | Canonical binary | Canonical binary | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34 | Sec 14.1 | Sec 10.1 | Sec 9 | Sec 11 | **CONSISTENT** |
-| **Bidirectional Peer Identity** | Symmetrical queries | Symmetrical queries | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 12 | Sec 10.1 | Sec 10 | Sec 10 | **CONSISTENT** |
-| **HKDF-SHA256 Keys & HMAC Proofs** | RFC 5869 keys + HMAC proofs | RFC 5869 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34 | Sec 14.2 | Sec 10.3 | Sec 11 | Sec 10 | **CONSISTENT** |
-| **Canonical FILETIME Ticks** | 64-bit integer ticks | Raw ticks | Integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 5-7 | Sec 7 | Sec 9 | Sec 7 | **CONSISTENT** |
-| **ShellExecute Flags & Ownership** | N/A | Zone preserved | `0x0400`; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3-4 | Sec 3-4 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Canonical VS Code Allowlist** | `vscode.*` namespace | Prohibit shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 3 | Sec 7 | **CONSISTENT** |
-| **Evidence & Gate Classification** | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Sec 8 | Sec 31 | Sec 14-15 | Sec 12-13 | Sec 16 | **CONSISTENT** |
+| Architectural Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Spec 51 | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **Named Pipe DACL SDDL** | `D:P(A;;RC;;;OW)...` | `(A;;RC;;;OW)` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10 | Sec 5 | Sec 4 | Sec 3-5 | Sec 7 | **CONSISTENT** |
+| **Owner Rights Restriction** | Restricted to `RC` | `OW` restricted | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10.3 | Sec 5.2 | Sec 4.4 | Sec 5 | Sec 7 | **CONSISTENT** |
+| **Client Access Mask & libuv** | `0x0012019B` | `0x0012019B` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.32 | Sec 10.4 | Sec 5.3 | Sec 6 | Sec 3-6 | Sec 8 | **CONSISTENT** |
+| **Isolated DACL & Squatting Proof** | Experiment B & C | Fail-closed | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.36 | Sec 10 | Sec 5 | Sec 4-6 | Sec 6 | Sec 7-9 | **CONSISTENT** |
+| **Pipe Flags & Parameter Separation** | `0x40080003` / `0x0008` | Fail-closed | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 5 | Sec 3 | Sec 7 | **CONSISTENT** |
+| **Bounded Event Queue & GIL Reality** | Bounded queue (64); GIL aware | Non-blocking | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.29, 5.33, 5.35, 5.37 | Sec 22.2 | Sec 8.2 | Sec 7 | Sec 7-8 | Sec 3-6 | **CONSISTENT** |
+| **Supervised Consumer & Coalescing** | `active <= 1`, `pending <= 1` | Bounded queue | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.24, 5.33 | Sec 23.1 | Sec 8.2 | Sec 7.4 | Sec 9 | Sec 4-6 | **CONSISTENT** |
+| **Hook Teardown Lifecycle** | Owner unhook | Timeout error | N/A | Exp F join | ADR-2C-13 | Sec 5.25 | Sec 21.2 | Sec 9 | Sec 8 (Scen 8) | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Handshake Transcript Wire Format** | Canonical binary | Canonical binary | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34, 5.38 | Sec 14.1 | Sec 10.1 | Sec 9 | Sec 11 | Sec 10 | **CONSISTENT** |
+| **Bidirectional Peer Identity** | Symmetrical queries | Symmetrical queries | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 12 | Sec 10.1 | Sec 10 | Sec 10 | Sec 10 | **CONSISTENT** |
+| **HKDF Keys, HMAC Proofs & Session Key** | RFC 5869 keys + HMAC proofs | RFC 5869 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34, 5.38 | Sec 14.2 | Sec 10.3 | Sec 11 | Sec 10 | Sec 10 | **CONSISTENT** |
+| **Canonical FILETIME Ticks** | 64-bit integer ticks | Raw ticks | Integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 5-7 | Sec 7 | Sec 9 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership** | N/A | Zone preserved | `0x0400`; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3-4 | Sec 3-4 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Canonical VS Code Allowlist** | `vscode.*` namespace | Prohibit shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 3 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Evidence & Gate Classification** | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Sec 8 | Sec 31 | Sec 14-15 | Sec 12-13 | Sec 16 | Sec 14 | **CONSISTENT** |
 
 ---
 

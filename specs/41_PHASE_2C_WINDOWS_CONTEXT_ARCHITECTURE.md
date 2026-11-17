@@ -232,54 +232,69 @@ While composite verification drastically minimizes handle-recycling risks, no us
   - Dedicated background OS thread: `WinEventHookThread`.
   - When idle, `GetMessageW` enters a Windows kernel wait state (`Executive/UserRequest`). CPU usage drops to near-zero (< 0.05% design target, < 0.20% acceptance ceiling), but Presence does not make misleading claims of "0.0% CPU" or "zero timer wakeups".
 
-### 6.2 Minimal, Non-Blocking, Reentrancy-Safe Callback & Coalesced Dispatch
-Out-of-context hook callbacks can be reentered if message pumping occurs during execution. Furthermore, scheduling an event-loop notification for every raw callback would create an **unbounded asyncio notification queue** if the asyncio loop is temporarily delayed.
+### 6.2 Bounded Python Queue & GIL-Aware Callback Dispatch (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37)
+Out-of-context hook callbacks can be reentered if message pumping occurs during execution. Furthermore, scheduling an event-loop notification for every raw callback would create an unbounded asyncio notification queue if the asyncio loop is temporarily delayed.
 
-To establish a strictly bounded, reentrancy-safe pipeline:
-1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate memory dynamically, make COM calls, or perform disk I/O.
+To establish a strictly bounded, reliable pipeline under CPython:
+1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate complex objects, make COM calls, or perform disk I/O.
 2. **Reentrancy Guard**: An atomic reentrancy flag (`_in_callback`) drops nested callback invocations immediately.
-3. **Bounded Raw Queue**: The callback places a compact tuple `(hwnd, time.monotonic())` into a thread-safe bounded queue (`collections.deque(maxlen=50)`). Overflow drops the oldest event to preserve the latest foreground state.
-4. **Single-Pending-Notification / Non-Blocking Coalescing Mechanism (P2C-24, P2C-29)**:
-   - Maintains synchronized state flags: `_notification_pending: bool = False`, `_shutdown_requested: bool = False`.
-   - Native callback uses **non-blocking lock acquisition** (`state.lock.acquire(blocking=False)`) to guarantee the Win32 message pump thread never stalls.
-   - When an event arrives:
-     * If `state.lock.acquire(blocking=False)` succeeds:
-       - Appends to `_raw_event_queue` (`deque(maxlen=50)`). Evicts oldest item if full, incrementing `events_dropped`.
-       - If `_notification_pending` is `False`: sets `_notification_pending = True`, increments `notification_callbacks_scheduled`, and dispatches notification via `loop.call_soon_threadsafe(manager._on_hook_event)`.
-       - If `_notification_pending` is `True`: increments `events_coalesced`; does **not** schedule duplicate callbacks.
-       - Releases lock.
-     * If lock acquisition fails (consumer thread is currently draining queue):
-       - Atomically assigns event tuple to single-slot fallback `state.concurrency_fallback_event`.
-       - Increments `events_coalesced` and returns immediately without blocking.
-5. **AsyncIO Consumer Draining & Race Elimination**:
-   - In `manager._on_hook_event`:
-     * Acquires `state.lock`.
-     * Drains all items from `_raw_event_queue` and clears the deque.
-     * Drains `state.concurrency_fallback_event` if non-None, resetting it to `None`.
-     * Resets `_notification_pending = False`.
-     * Increments `notification_callbacks_executed`.
-     * Releases `state.lock`.
-     * Processes latest foreground event outside the lock.
-6. **Bounded Invariants**:
-   - `pending_notification_count <= 1` at all times.
-   - Lock hold duration inside callback is $O(1)$ memory manipulation; callback never stalls on asyncio execution.
+3. **CPython GIL Reality (P2C-37)**: The Win32 `WinEventProc` callback is invoked from an OS thread via ctypes. Entering Python requires acquiring the CPython GIL (`PyGILState_Ensure`). Under CPU-bound execution on other threads, callback execution may experience microsecond scheduling delays. Presence avoids false claims of "lock-free" or "hard non-blocking" native guarantees. Instead, it guarantees **zero application-level blocking lock waits**, bounded memory, and measurable microsecond execution latency.
+4. **Bounded Python Queue (P2C-35)**:
+   - Uses a strictly bounded queue (`collections.deque(maxlen=64)` protected by an internal `threading.Lock`).
+   - Usable capacity is exactly **64 entries**.
+   - **Strict Ownership**:
+     * **Producer (Hook Thread)** owns appending items, checking capacity, and incrementing `events_dropped`. Producer **never** modifies consumer read pointers.
+     * **Consumer (Worker Task)** owns draining items in atomic batches and updating processing telemetry. Consumer **never** modifies producer write pointers.
+   - **Overflow Policy**: When the queue reaches capacity (64), incoming events are discarded (dropped), and `events_dropped` is incremented. Because desktop tracking prioritizes the *current active window* over historical intermediate switches, the consumer worker recovers the authoritative live foreground state by querying `GetForegroundWindow()` upon wake-up.
+5. **Single-Pending Wake-Up Coalescing**:
+   - Invariant: `pending_notification_count <= 1` at all times.
+   - When an event is pushed: if `notification_pending` is `False`, it is set to `True`, and a single wake-up is signaled via `loop.call_soon_threadsafe(event_available.set)`. Subsequent burst events increment `events_coalesced` without scheduling duplicate loop callbacks.
+6. **AsyncIO Consumer Draining**:
+   - The worker task wakes, clears `event_available`, resets `notification_pending = False`, and atomically drains the queue batch.
+   - Intermediate rapid focus flips are collapsed: the worker processes the latest event or validates against live `GetForegroundWindow()`.
 
 ```python
+class BoundedEventQueue:
+    def __init__(self, capacity: int = 64):
+        self.capacity = capacity
+        self._lock = threading.Lock()
+        self._deque = collections.deque(maxlen=capacity)
+        self.events_dropped = 0
+        self.raw_events_received = 0
+        self.events_drained = 0
+        self.queue_high_water_mark = 0
+
+    def push(self, event: tuple) -> bool:
+        """Producer: appends event if under capacity (64), drops newest if full."""
+        with self._lock:
+            self.raw_events_received += 1
+            if len(self._deque) >= self.capacity:
+                self.events_dropped += 1
+                return False
+            self._deque.append(event)
+            if len(self._deque) > self.queue_high_water_mark:
+                self.queue_high_water_mark = len(self._deque)
+            return True
+
+    def drain(self) -> list:
+        """Consumer: batch drains all pending events."""
+        with self._lock:
+            if not self._deque:
+                return []
+            batch = list(self._deque)
+            self._deque.clear()
+            self.events_drained += len(batch)
+            return batch
+
 class WinEventCallbackState:
-    def __init__(self, loop, on_event_callback, max_queue=50):
+    def __init__(self, loop, capacity=64):
         self.loop = loop
-        self.on_event = on_event_callback
-        self.queue = deque(maxlen=max_queue)
-        self.lock = threading.Lock()
+        self.queue = BoundedEventQueue(capacity=capacity)
         self.in_callback = False
         self.notification_pending = False
         self.shutdown_requested = False
-        self.concurrency_fallback_event = None
-        # Instrumentation counters
-        self.raw_events_received = 0
+        self.signal_event_available = None  # asyncio.Event.set
         self.events_coalesced = 0
-        self.events_dropped = 0
-        self.queue_high_water_mark = 0
         self.notification_callbacks_scheduled = 0
         self.notification_callbacks_executed = 0
 
@@ -296,15 +311,13 @@ def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventT
     try:
         now_mono = time.monotonic()
         event_tuple = (hwnd, dwmsEventTime, now_mono)
-        state.raw_events_received += 1
 
-        # Race-Free Event Dispatch via Bounded SPSC Ring Buffer (P2C-29 & P2C-33)
-        # Hook thread is the sole producer; pushes event into bounded ring buffer (maxlen=64)
-        if not state.ring_buffer.push(event_tuple):
-            state.events_dropped += 1
+        # Producer pushes into bounded queue (capacity 64)
+        if not state.queue.push(event_tuple):
+            # Queue was full; event dropped per overflow policy
+            pass
         else:
-            state.events_received += 1
-            # Single-pending wake-up coalescing for the supervised consumer worker
+            # Wake-up coalescing: schedule at most one pending notification
             if not state.notification_pending:
                 state.notification_pending = True
                 state.notification_callbacks_scheduled += 1
@@ -413,14 +426,14 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
    - Explicit user-mediated command generates a 256-bit pairing secret ($K_{\text{pair}}$).
    - Stored in VS Code `SecretStorage` (DPAPI) and Presence credential vault (DPAPI).
    - **Never** exposed via command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-3. **Canonical Binary Transcript Serialization ($T$) & Strict Field Validation (P2C-30, P2C-34)**:
-   The handshake transcript $T$ is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit exceptions (never bare assertions):
+3. **Canonical Binary Transcript Serialization ($T$) & Strict Field Validation (P2C-30, P2C-34, P2C-38)**:
+   The handshake transcript $T$ is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit `TypeError` and `ValueError` exceptions (never bare assertions):
    - Protocol version: `1 <= version <= 0xFFFFFFFF`
-   - Endpoint: Valid pipe syntax matching `^\\\\\.\\pipe\\[A-Za-z0-9._-]+$`, length `<= 0xFFFF`
+   - Endpoint: Strict full-match pipe pattern `\A\\\\\.\\pipe\\[A-Za-z0-9._-]+\Z`, length `<= 0xFFFF`
    - PIDs: `0 <= pid <= 0xFFFFFFFF`
    - Creation ticks: `0 <= ticks <= 0xFFFFFFFFFFFFFFFF`
-   - Logon SIDs: Valid string format matching `^S-1-5-5-\d+-\d+$`, length `<= 0xFFFF`
-   - Nonces: Exactly 32 bytes each
+   - Logon SIDs: Strict full-match Logon SID pattern `\AS-1-5-5-\d+-\d+\Z`, length `<= 0xFFFF`
+   - Nonces: Exactly 32 raw random bytes each
    - Negotiated parameter: `max_payload_bytes` (uint32_be = 65536)
    ```
    [4 bytes] protocol_version (uint32_be = 0x00000001)
@@ -435,16 +448,16 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
    [32 bytes] client_nonce (raw random bytes)
    [4 bytes] max_payload_bytes (uint32_be = 65536)
    ```
-4. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34)**:
+4. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34, P2C-38)**:
    - Server sends `AUTH_CHALLENGE`: 32-byte `server_nonce`.
    - Client generates 32-byte `client_nonce`.
    - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
      $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
    - Both endpoints derive separate, purpose-specific keys via HKDF-Expand:
      $$\begin{aligned}
-     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
-     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
-     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"}, 32)
+     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
+     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
+     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel \text{SHA256}(T), 32)
      \end{aligned}$$
    - Client calculates authentication proof and sends `AUTH_RESPONSE`:
      $$\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$$
@@ -452,7 +465,7 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
    - Server returns `AUTH_CONFIRM` with `server_proof`:
      $$\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$$
    - Client independently verifies `server_proof` using `secrets.compare_digest`.
-   - Ephemeral symmetric key $K_{\text{session}}$ is established for the session. Nonces expire after 10 seconds; single-use cache prevents replay attacks.
+   - Ephemeral symmetric key $K_{\text{session}}$ binds the complete transcript hash $\text{SHA256}(T)$ and is **reserved/deferred** for future post-handshake message framing (Phase 2D). For Phase 2C, post-handshake messages travel over the local Windows named pipe secured by Logon SID DACL isolation and single-instance enforcement. Nonces expire after 10 seconds; single-use cache prevents replay attacks.
 
 ### 7.3 Message Framing & Canonical Operation Allowlist (P2C-27)
 - **Framing**: Byte stream with 4-byte big-endian unsigned integer length prefix (`>I`), max frame 64 KB (`65536` bytes). Payloads exceeding 64 KB cause immediate connection termination.

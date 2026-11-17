@@ -235,30 +235,39 @@ In accordance with Presence engineering principles, mature open-source projects,
 
 ---
 
-### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Race-Free Bounded Dispatch Model (P2C-20, P2C-24, P2C-25, P2C-29, P2C-33)
+### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Bounded Event Dispatch Model (P2C-20, P2C-24, P2C-25, P2C-29, P2C-33, P2C-35, P2C-37)
 - **Status**: **APPROVED**
-- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, blocking locks in native callbacks stall the message pump, and unsynchronized fallback slots risk lost wakeups. Hook destruction ownership must belong strictly to the installing thread, and processing tasks must remain bounded.
+- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Hook callbacks entering Python via ctypes must acquire the CPython GIL (`PyGILState_Ensure`). Index ownership in circular queues must remain strictly separated. Hook destruction ownership must belong strictly to the installing thread, and processing tasks must remain bounded.
 - **Decision**:
   1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
-  2. Implement reentrancy guard (`_in_callback` flag) and bounded Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64). Producer thread never blocks and never waits on consumer.
-  3. Implement **Wake-Up Coalescing & Supervised Single Consumer Worker (P2C-24, P2C-33)**:
+  2. Implement reentrancy guard (`_in_callback` flag) and bounded Python queue (`collections.deque(maxlen=64)` protected by an internal lock). Usable capacity is exactly **64 entries**.
+  3. **Strict Ownership & Overflow Model (P2C-35)**:
+     - Producer appends to queue and owns overflow accounting (`events_dropped`). Producer never modifies consumer read state.
+     - Consumer drains batches and owns processing telemetry. Consumer never modifies producer write state.
+     - Overflow policy: when full (64 entries), newest incoming events are dropped. Consumer recovers authoritative live state via `GetForegroundWindow()` on wake-up.
+  4. **CPython GIL Reality (P2C-37)**:
+     - The ctypes callback entering Python acquires the GIL. System guarantees zero application-level blocking lock waits and bounded microsecond latency, avoiding unsupported "lock-free" or "hard non-blocking" claims.
+  5. Implement **Wake-Up Coalescing & Supervised Single Consumer Worker (P2C-24, P2C-33)**:
      - Synchronized state flag `_notification_pending: bool`.
-     - When producer pushes into ring buffer: if `_notification_pending` is False, sets flag to True and signals consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
+     - When producer pushes into queue: if `_notification_pending` is False, sets flag to True and signals consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
      - Supervised single consumer worker task maintains invariant:
        $$\text{active\_foreground\_consumer\_count} \le 1, \quad \text{pending\_notification\_count} \le 1 \quad \forall t$$
-     - Worker wakes on `_event_available.wait()`, clears the event, drains the ring buffer, selects the latest relevant foreground event, and processes it asynchronously outside synchronization boundaries.
-  4. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
+     - Worker wakes on `_event_available.wait()`, clears the event, drains the queue, selects the latest relevant foreground event or validates with `GetForegroundWindow()`, and processes it asynchronously outside synchronization boundaries.
+  6. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
      - `UnhookWinEvent(self._hHook)` is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
      - Runtime thread joins hook thread with 1.0s timeout. If alive after timeout, reports `HookShutdownTimeoutError` (do not claim clean termination).
-  5. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
+  7. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
+  - *SPSC index mutation across threads*: Violates single-producer ownership and causes race conditions during overflow. Corrected.
+  - *Native C DLL Queue*: Adds compilation, binary distribution, and unmanaged crash risks without measurable real-world benefit over bounded Python queue. Rejected.
   - *Blocking lock acquisition in hook proc*: Stalls the Win32 message pump during consumer contention. Rejected.
   - *Unsynchronized fallback slot*: Introduces lost-wakeup race where events remain stranded after consumer drain. Rejected.
   - *Creating detached task per event*: Causes unbounded task accumulation during slow coroutine processing. Rejected.
   - *Scheduling notification on every event*: Floods asyncio event loop with unbounded callbacks during Alt-Tab storms. Rejected.
   - *Unhooking from runtime thread*: Violates Win32 thread affinity for hooks, introducing race conditions. Rejected.
   - *Assuming thread termination on timeout*: Masked hung thread bugs. Rejected.
-- **Technical Justification**: SPSC ring buffer with supervised single consumer worker guarantees the native hook callback is strictly non-blocking ($O(1)$) while ensuring zero lost wakeups, strictly bounding active processing tasks ($O(1)$), and bounding asyncio callback queues.
+- **Technical Justification**: Bounded Python queue with supervised single consumer worker guarantees zero application lock waits, zero lost wakeups, strictly bounds active processing tasks ($O(1)$), and bounds asyncio callback queues.
+- **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 64 in queue, exactly 1 pending notification callback, and exactly 1 active consumer task.
 - **Security Consequences**: Prevents UI stuttering and eliminates denial-of-service vectors against the desktop message loop.
 - **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 64 in ring buffer, exactly 1 pending notification callback, and exactly 1 active consumer task.
 - **Limitations**: Coalescing burst events prioritizes the latest foreground window state.
@@ -284,8 +293,8 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-09** | Terminology | Job Objects = Process Lifecycle Containment | Accurate Windows OS security taxonomy (not a security sandbox) |
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
-| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004; canonical transcript; separate HKDF keys + HMAC proofs |
-| **ADR-2C-13** | Hook Model | Race-free SPSC event dispatch & supervised worker | Non-blocking SPSC ring buffer; wake-up coalescing (`<= 1`); single consumer worker (`<= 1`); owner unhooks |
+| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004 (isolated DACL test verified); fullmatch validation; session key reserved/deferred |
+| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Bounded Python queue (capacity 64); strict index ownership; GIL awareness; wake-up coalescing (`<= 1`); single consumer worker (`<= 1`); owner unhooks |
 
 ---
 

@@ -187,31 +187,31 @@ Because multiple processes or same-user tools can run simultaneously, OS checks 
    - User enters secret directly into VS Code extension UI; extension stores secret in VS Code `context.secrets` (`SecretStorage`, backed by Windows DPAPI / Credential Manager).
    - In Presence, stored in user-scoped DPAPI credential store.
    - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-2. **Canonical Binary Transcript Serialization ($T$) & Validation (P2C-30, P2C-34)**:
-   The transcript is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit exceptions:
+2. **Canonical Binary Transcript Serialization ($T$) & Strict Validation (P2C-30, P2C-34, P2C-38)**:
+   The transcript is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit `TypeError` and `ValueError` exceptions using strict end-of-string regex matching (`\A...\Z`):
    ```
    [4 bytes] protocol_version (uint32_be = 0x00000001)
-   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, max 256)
+   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, pattern \A\\\\\.\\pipe\\[A-Za-z0-9._-]+\Z)
    [4 bytes] server_pid (uint32_be)
    [8 bytes] server_creation_filetime_ticks (uint64_be)
-   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII, max 128)
+   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII, pattern \AS-1-5-5-\d+-\d+\Z)
    [4 bytes] client_pid (uint32_be)
    [8 bytes] client_creation_filetime_ticks (uint64_be)
-   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, max 128)
+   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, pattern \AS-1-5-5-\d+-\d+\Z)
    [32 bytes] server_nonce (raw random bytes)
    [32 bytes] client_nonce (raw random bytes)
    [4 bytes] max_payload_bytes (uint32_be = 65536)
    ```
-3. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34)**:
+3. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34, P2C-38)**:
    - Server issues fresh 32-byte cryptographically secure random `server_nonce`.
    - Client generates 32-byte `client_nonce`.
    - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
      $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
    - Both endpoints derive separate, purpose-specific keys via HKDF-Expand:
      $$\begin{aligned}
-     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
-     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
-     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"}, 32)
+     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
+     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
+     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel \text{SHA256}(T), 32)
      \end{aligned}$$
    - Client calculates authentication proof and sends `AUTH_RESPONSE`:
      $$\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$$
@@ -219,7 +219,7 @@ Because multiple processes or same-user tools can run simultaneously, OS checks 
    - Server replies with `AUTH_CONFIRM` with `server_proof`:
      $$\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$$
    - Client independently verifies `server_proof` using `secrets.compare_digest`.
-   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$).
+   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$) bound to $\text{SHA256}(T)$. $K_{\text{session}}$ is **reserved/deferred** for future post-handshake message framing (Phase 2D). For Phase 2C, post-handshake messages travel over the local Windows named pipe secured by Logon SID DACL isolation and single-instance enforcement.
    - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
    - Handshake timeout is 500 ms. Maximum 1 active client connection (`nMaxInstances = 1`). Disconnects immediately on failure.
 

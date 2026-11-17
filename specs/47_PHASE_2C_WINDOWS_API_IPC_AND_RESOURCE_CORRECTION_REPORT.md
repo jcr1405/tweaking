@@ -712,19 +712,19 @@ Standardized Experiment F verifies total cleanup upon runtime exit:
 
 ## 28. Cross-Specification Consistency Matrix
 
-| Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Status |
-|---|---|---|---|---|---|---|---|---|---|---|:---:|
-| **ShellExecute Flags (P2C-17)** | N/A | Zone checks preserved | Flag constants; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3 | Sec 3-4 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Shell Execution Class (P2C-17)** | N/A | Class C async | Class C async; Python wrapper | Subphase 2C.4 | ADR-2C-10 | Sec 3.2 | Sec 4 | Sec 4 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Canonical FILETIME (P2C-18)** | Raw ticks | WindowIdentity ticks | TOCTOU raw integer ticks | Subphase 2C.0/1 | ADR-2C-11 | Sec 3.3 | Sec 5 | Sec 7 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Integer FILETIME Math (P2C-23)** | Integer formulas | N/A | Raw integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 6-7 | Sec 7 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Pipe DACL & Owner Rights (P2C-21, 28, 32)** | (A;;RC;;;OW) Logon SID only | SDDL 0x12019b; withhold 0x0004; OW RC | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.28 | Sec 10 | Sec 5 | Sec 4-6 | Sec 3-6 | **CONSISTENT** |
-| **Pipe Parameter Separation (P2C-22)** | 0x40080003 vs 0x0008 | Fail-closed squatting defense | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 2 | Sec 3 | **CONSISTENT** |
-| **Transcript HMAC & HKDF (P2C-26, 30, 34)** | Canonical binary $T$; HKDF-SHA256 | Bidirectional peer IDs; HKDF-SHA256 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.26, 5.30 | Sec 13-16 | Sec 10-11 | Sec 9-11 | Sec 10-12 | **CONSISTENT** |
-| **Canonical Allowlist (P2C-27)** | vscode.* allowlist | Prohibit provider.shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Race-Free WinEvent Dispatch (P2C-24, 29, 33)** | SPSC buffer; single worker | Threat T-01 queue bounded | N/A | Exp G; 12 counters; test matrix | ADR-2C-13 | Sec 5.24, 5.29 | Sec 22-23 | Sec 8 | Sec 7-8 | Sec 7-9 | **CONSISTENT** |
-| **Owner Hook Teardown (P2C-25)** | Hook thread teardown | Timeout error reporting | N/A | Exp F join timeout | ADR-2C-13 | Sec 5.25 | Sec 21, 27 | Sec 9 | Sec 2 | Sec 7 | **CONSISTENT** |
-| **Resource Budgets & Experiments** | Empirical budgets | Leak targets | Latency budgets | Exp A-G table | ADR-2C-13 | Sec 3.5 | Sec 25-27 | Sec 8, 14 | Sec 2 | Sec 13 | **CONSISTENT** |
+| Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Spec 51 | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **ShellExecute Flags (P2C-17)** | N/A | Zone checks preserved | Flag constants; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3 | Sec 3-4 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Shell Execution Class (P2C-17)** | N/A | Class C async | Class C async; Python wrapper | Subphase 2C.4 | ADR-2C-10 | Sec 3.2 | Sec 4 | Sec 4 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Canonical FILETIME (P2C-18)** | Raw ticks | WindowIdentity ticks | TOCTOU raw integer ticks | Subphase 2C.0/1 | ADR-2C-11 | Sec 3.3 | Sec 5 | Sec 7 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Integer FILETIME Math (P2C-23)** | Integer formulas | N/A | Raw integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 6-7 | Sec 7 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Pipe DACL & Isolated Proof (P2C-21, 28, 32, 36)** | (A;;RC;;;OW) Logon SID only | SDDL 0x12019b; withhold 0x0004; OW RC | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.28, 5.36 | Sec 10 | Sec 5 | Sec 4-6 | Sec 3-6 | Sec 7-9 | **CONSISTENT** |
+| **Pipe Parameter Separation (P2C-22)** | 0x40080003 vs 0x0008 | Fail-closed squatting defense | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 2 | Sec 3 | Sec 7 | **CONSISTENT** |
+| **Transcript HMAC & HKDF (P2C-26, 30, 34, 38)** | Canonical binary $T$; fullmatch | Bidirectional peer IDs; HKDF-SHA256 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.26, 5.30, 5.38 | Sec 13-16 | Sec 10-11 | Sec 9-11 | Sec 10-12 | Sec 10 | **CONSISTENT** |
+| **Canonical Allowlist (P2C-27)** | vscode.* allowlist | Prohibit provider.shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Bounded Event Queue & GIL Reality (P2C-24, 29, 33, 35, 37)** | Bounded queue (64); GIL aware | Threat T-01 queue bounded | N/A | Exp G; 12 counters; test matrix | ADR-2C-13 | Sec 5.24, 5.29, 5.35, 5.37 | Sec 22-23 | Sec 8 | Sec 7-8 | Sec 7-9 | Sec 3-6 | **CONSISTENT** |
+| **Owner Hook Teardown (P2C-25)** | Hook thread teardown | Timeout error reporting | N/A | Exp F join timeout | ADR-2C-13 | Sec 5.25 | Sec 21, 27 | Sec 9 | Sec 2 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Resource Budgets & Experiments** | Empirical budgets | Leak targets | Latency budgets | Exp A-G table | ADR-2C-13 | Sec 3.5 | Sec 25-27 | Sec 8, 14 | Sec 2 | Sec 13 | Sec 13 | **CONSISTENT** |
 
 ---
 

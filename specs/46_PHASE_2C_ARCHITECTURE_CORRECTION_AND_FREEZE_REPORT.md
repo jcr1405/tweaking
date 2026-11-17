@@ -470,38 +470,55 @@ The audit examined five existing architecture documents and three primary implem
 
 ---
 
+### 5.35 Finding P2C-35: SPSC Ring Buffer Index Ownership & Capacity
+- **Original Flaw**: The SPSC pseudocode in Specification 50 permitted the producer to modify the consumer-owned `head` index on buffer full, violating single-producer ownership, and misstated usable capacity.
+- **Corrective Decision**: Restored strict ownership boundaries: producer exclusively owns appending and overflow accounting; consumer exclusively owns draining and release of slots. Bounded Python queue with capacity 64 drops newest incoming events on overflow and relies on `GetForegroundWindow()` live recovery.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.36 Finding P2C-36: Named-Pipe Isolated DACL Proof
+- **Original Flaw**: Previous instance-creation denial test was confounded by `nMaxInstances = 1` returning `ERROR_PIPE_BUSY` (`231`).
+- **Corrective Decision**: Executed isolated DACL test with `nMaxInstances = 2`. The secondary process under the same Logon SID was denied with `ERROR_ACCESS_DENIED` (`5`), conclusively proving that the DACL withholds `0x0004` independently of instance capacity limits. Genuine pipe-squatting tests (C.1 and C.2) also verified fail-closed behavior.
+- **Classification**: **VERIFIED EXPERIMENTALLY**.
+
+---
+
+### 5.37 Finding P2C-37: Python GIL Reality & Callback Execution Model
+- **Original Flaw**: Claimed "lock-free" and "hard non-blocking" callback behavior for a ctypes callback that must acquire the CPython GIL.
+- **Corrective Decision**: Evaluated Option A (Bounded Python Queue) versus Option B (Native C DLL). Selected Option A for simplicity and zero dependencies, explicitly documenting that callback execution incurs microsecond GIL scheduling without application-level lock contention.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.38 Finding P2C-38: Strict Transcript Validation & Session-Key Refinement
+- **Original Flaw**: Transcript regex used partial matching (`re.match()`) rather than full-string anchoring, and `K_session` application status was ambiguous.
+- **Corrective Decision**: Enforced strict `re.fullmatch()` on pipe endpoints and Logon SIDs. Bound transcript hash $\text{SHA256}(T)$ into session-key derivation, and explicitly documented `K_session` as reserved/deferred for future post-handshake framing.
+- **Classification**: **CORRECTED**.
+
+---
+
 ## 6. Cross-Specification Consistency Matrix
 
-All ten architecture specifications were audited together to ensure total cross-document alignment:
+All eleven architecture specifications were audited together to ensure total cross-document alignment:
 
-| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Alignment Verdict |
-|---|---|---|---|---|---|---|---|---|---|---|:---:|
-| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
-| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
-| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
-| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
-| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
-| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
-| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | **CONSISTENT** |
-| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | Sec 4 | Sec 7 | **CONSISTENT** |
-| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | Sec 7 | Sec 7 | **CONSISTENT** |
-| **Named Pipe DACL & Owner Rights**| D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)| RC to OW; Logon SID only | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21/28/32 | Sec 9-11 | Sec 5 | Sec 4-5 | Sec 3-6 | **CONSISTENT** |
-| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | Sec 6 | Sec 3 | **CONSISTENT** |
-| **Race-Free WinEvent SPSC & Worker**| SPSC buffer; single worker | Threat T-01 bounded | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24/29/33 | Sec 21-24 | Sec 8 | Sec 7 | Sec 7-9 | **CONSISTENT** |
-| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | Sec 8 | Sec 7 | **CONSISTENT** |
-| **Binary Transcript HKDF/HMAC**| Canonical binary T; separate keys + proofs | Bidirectional peer identity; HKDF | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26/30/34 | Sec 13-16 | Sec 10 | Sec 9-11 | Sec 10-12 | **CONSISTENT** |
-| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | **CONSISTENT** |
-| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
-| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
-| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | **CONSISTENT** |
-| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | Sec 4 | **CONSISTENT** |
-| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | Sec 7 | **CONSISTENT** |
-| **Named Pipe DACL & Owner Rights**| D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)| RC to OW; Logon SID only | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21/28 | Sec 9-11 | Sec 5 | Sec 4-5 | **CONSISTENT** |
-| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | Sec 6 | **CONSISTENT** |
-| **Non-Blocking WinEvent Coalescing**| Try-lock + fallback slot | Threat T-01 bounded | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24/29 | Sec 21-24 | Sec 8 | Sec 7 | **CONSISTENT** |
-| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | Sec 8 | **CONSISTENT** |
-| **Binary Transcript HKDF Auth**| Canonical binary T; HKDF-SHA256 | Bidirectional peer identity; HKDF | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26/30 | Sec 13-16 | Sec 10 | Sec 9-11 | **CONSISTENT** |
-| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 12 | **CONSISTENT** |
+| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Spec 51 | Alignment Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | Sec 8 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | Sec 8 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | Sec 8 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | Sec 4 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | Sec 7 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Named Pipe DACL & Isolated Proof**| D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)| RC to OW; Logon SID only | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21/28/32/36 | Sec 9-11 | Sec 5 | Sec 4-5 | Sec 3-6 | Sec 7-9 | **CONSISTENT** |
+| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | Sec 6 | Sec 3 | Sec 7 | **CONSISTENT** |
+| **Bounded Event Queue & GIL Reality**| Bounded queue (64); GIL aware | Threat T-01 bounded | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24/29/33/35/37 | Sec 21-24 | Sec 8 | Sec 7 | Sec 7-9 | Sec 3-6 | **CONSISTENT** |
+| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | Sec 8 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Binary Transcript HKDF/HMAC**| Canonical binary T; separate keys + proofs | Bidirectional peer identity; HKDF | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26/30/34/38 | Sec 13-16 | Sec 10 | Sec 9-11 | Sec 10-12 | Sec 10 | **CONSISTENT** |
+| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | Sec 7 | **CONSISTENT** |
 
 ---
 

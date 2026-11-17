@@ -73,11 +73,14 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - Implement `ForegroundWindowSource` using `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`.
   - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
   - Implement hook callback reentrancy guard (`_in_callback` flag) and compact event queuing (`collections.deque(maxlen=50)`).
-  - Implement **Race-Free Bounded Event Dispatch & Supervised Consumer (P2C-24, P2C-29, P2C-33)**:
+  - Implement **Bounded Event Dispatch & Supervised Consumer (P2C-24, P2C-29, P2C-33, P2C-35, P2C-37)**:
     * Synchronized state flags: `_notification_pending: bool = False`, `_shutdown_requested: bool = False`.
-    * Native callback pushes into bounded Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64) without blocking. Producer never blocks and never waits on the consumer.
+    * Native callback pushes into a bounded Python queue (`collections.deque(maxlen=64)` protected by an internal lock) with exact usable capacity of **64 entries**.
+    * Strict ownership: Producer appends items and increments `events_dropped` on overflow; consumer drains batches and updates delay telemetry. Neither modifies the other's state pointers.
+    * CPython GIL reality: Win32 hook callback entering Python via ctypes requires acquiring the CPython GIL (`PyGILState_Ensure`). System guarantees zero application-level blocking lock waits and bounded microsecond latency without making unverified "lock-free" claims.
+    * Overflow policy: If the queue is full (64), incoming events are discarded and `events_dropped` is incremented. On wakeup, the consumer queries `GetForegroundWindow()` to recover the live active window state.
     * Wake-up coalescing: if `_notification_pending` is False, sets `_notification_pending = True`, increments `notification_callbacks_scheduled`, and signals the consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
-    * Supervised Single-Consumer Worker: runs a dedicated, persistent worker task with invariant `active_foreground_consumer_count <= 1`. Worker wakes on `_event_available.wait()`, clears the event, drains the ring buffer, selects the latest relevant foreground event, and processes it outside synchronization boundaries.
+    * Supervised Single-Consumer Worker: runs a dedicated, persistent worker task with invariant `active_foreground_consumer_count <= 1`. Worker wakes on `_event_available.wait()`, clears the event, drains the queue, selects the latest relevant foreground event or validates with `GetForegroundWindow()`, and processes it outside synchronization boundaries.
     * Guaranteed invariants:
       $$\text{pending\_notification\_count} \le 1, \quad \text{active\_foreground\_consumer\_count} \le 1 \quad \forall t$$
   - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped`, `events_overwritten`, `queue_high_water_mark`, `notification_callbacks_scheduled`, `notification_callbacks_executed`, `max_event_processing_delay`, `pending_notification_count`, `active_foreground_consumer_count`, `fallback_events_recorded`, `fallback_events_consumed`, `wakeups_recovered`.
@@ -215,16 +218,17 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
       - **Layer 3 (Pairing & Canonical Binary Transcript HKDF-SHA256 Mutual Authentication)**:
         * Short-lived user pairing command: `presence vscode-pair` (256-bit secret $K_{\text{pair}}$, 5-minute TTL, single-use).
         * Stored in VS Code `SecretStorage` (DPAPI) and Presence user vault. Never passed in CLI args, env vars, history, or logs.
-        * Canonical binary transcript serialization ($T$) with strict field validation using big-endian integers and length-prefixed strings:
+        * Canonical binary transcript serialization ($T$) with strict field validation using big-endian integers and length-prefixed strings (strict fullmatch regex `\A...\Z` for endpoints and Logon SIDs, no bare asserts):
           `[uint32_be version][uint16_be ep_len + ep][uint32_be s_pid][uint64_be s_ticks][uint16_be s_sid_len + s_sid][uint32_be c_pid][uint64_be c_ticks][uint16_be c_sid_len + c_sid][32B s_nonce][32B c_nonce][uint32_be max_payload_bytes]`
         * Standard HKDF-SHA256 (RFC 5869) Key Derivation:
           - $\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$.
-          - $K_{\text{client\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32)$.
-          - $K_{\text{server\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32)$.
-          - $K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"}, 32)$.
+          - $K_{\text{client\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32)$.
+          - $K_{\text{server\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32)$.
+          - $K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{b"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel \text{SHA256}(T), 32)$.
         * Mutual challenge-response:
           - $\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$, verified with `secrets.compare_digest`.
           - $\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$, verified with `secrets.compare_digest`.
+        * Session Key ($K_{\text{session}}$) Status: Established and bound to transcript hash $\text{SHA256}(T)$, but **explicitly reserved/deferred** for future post-handshake message framing (Phase 2D). For Phase 2C, data frames travel over the local named pipe secured by Logon SID DACL isolation.
       - **Layer 4 (Framing, Payload Bounds & Canonical Operation Allowlist)**:
         * 4-byte big-endian length prefix (`>I`), hard 64 KB (`65536` bytes) payload ceiling.
         * Canonical operation allowlist: `vscode.ping`, `vscode.get_active_workspace`, `vscode.get_active_editor_metadata`, `vscode.get_open_documents`.

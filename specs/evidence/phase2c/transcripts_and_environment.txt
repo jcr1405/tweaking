@@ -1,0 +1,99 @@
+PRESENCE PHASE 2C — EVIDENCE LOG & EXECUTION TRANSCRIPTS
+Generated: 2026-11-17
+Host Environment:
+- OS: Microsoft Windows 11 Home Single Language, Build 26200
+- Python: 3.12.7 (64-bit AMD64)
+- Node.js: v24.15.0 (C:\Program Files\nodejs\node.exe)
+- libuv: 1.51.0 (process.versions.uv)
+- V8: 13.4.114.21-node.24
+- Active User Owner SID: S-1-5-21-3073610430-1898059206-355832718-1001
+- Active Interactive Logon SID: S-1-5-5-0-2023669
+
+================================================================================
+EXPERIMENT A: Production Configuration (Node.js/libuv Interoperability)
+Command: python specs\evidence\phase2c\run_interop.py
+--------------------------------------------------------------------------------
+--- EXPERIMENT A: Production Configuration (Node.js/libuv Client) ---
+
+--- SERVER OUTPUT ---
+SERVER: Created pipe \\.\pipe\presence-production-interop-test with handle 528
+SERVER: Waiting for client connection...
+SERVER: Client connected successfully!
+SERVER: Received 32 bytes from client: 'Hello from Node.js libuv client!'
+SERVER: Sent 53 bytes ACK to client.
+SERVER: Clean shutdown completed.
+
+--- CLIENT OUTPUT ---
+CLIENT: Node.js v24.15.0, libuv 1.51.0
+CLIENT: Connecting to \\.\pipe\presence-production-interop-test...
+CLIENT: Connected via libuv!
+CLIENT: Sending 32 bytes: 'Hello from Node.js libuv client!'
+CLIENT: Received 53 bytes: 'PRESENCE_SERVER_ACK: Hello from Node.js libuv client!'
+CLIENT: Closing socket cleanly.
+CLIENT: Server disconnected (EOF received).
+CLIENT: Socket closed.
+
+--- RESULT ---
+Client Status: PASS (code 0)
+Server Status: PASS (code 0)
+
+================================================================================
+EXPERIMENTS B, C, D: Named Pipe DACL & Squatting Isolation Tests
+Command: python specs\evidence\phase2c\pipe_acl_experiments.py
+--------------------------------------------------------------------------------
+Active Process Owner SID: S-1-5-21-3073610430-1898059206-355832718-1001
+Active Process Logon SID: S-1-5-5-0-2023669
+
+--- EXPERIMENT B: Isolated DACL Instance-Creation Check ---
+Pipe Name: \\.\pipe\presence-dacl-isolated-test
+nMaxInstances: 2
+SDDL: D:P(A;;RC;;;OW)(A;;0x12019b;;;S-1-5-5-0-2023669)
+Instance 1 CreateNamedPipeW: Handle = 640, Error = 0
+Instance 2 CreateNamedPipeW: Handle = 18446744073709551615, Error = 5
+>>> RESULT: SUCCESS! ERROR_ACCESS_DENIED (5) confirmed! Caller lacks FILE_CREATE_PIPE_INSTANCE (0x0004) even though nMaxInstances = 2.
+
+--- EXPERIMENT C: Genuine Pipe-Squatting Test ---
+C.1 Rogue pipe creation (max=1): Handle = 640, Error = 0
+C.1 Presence CreateNamedPipeW (FIRST_INSTANCE against max=1): Handle = 18446744073709551615, Error = 231
+C.2 Rogue pipe creation (max=255): Handle = 640, Error = 0
+C.2 Presence CreateNamedPipeW (FIRST_INSTANCE against max=255): Handle = 18446744073709551615, Error = 5
+>>> RESULT: SUCCESS! Both squatting scenarios fail closed! (C.1 -> 231, C.2 -> 5 / ERROR_ACCESS_DENIED). Presence never connects to or reuses squatted pipe!
+
+--- EXPERIMENT D: DACL Modification Test ---
+Client CreateFileW: Handle = 636, Error = 0
+Client SetKernelObjectSecurity: Return = 0, Error = 5
+>>> RESULT: SUCCESS! Client DACL modification blocked with ERROR_ACCESS_DENIED (5)!
+
+================== SUMMARY ==================
+Experiment B (Isolated DACL Instance Denied): PASS
+Experiment C (Genuine Squatting Fail-Closed): PASS
+Experiment D (Client DACL Rewrite Blocked):    PASS
+=============================================
+
+================================================================================
+QUEUE CONCURRENCY & STRESS HARNESS: 10 Concurrency Scenarios
+Command: python specs\evidence\phase2c\queue_stress_test.py
+--------------------------------------------------------------------------------
+================== QUEUE CONCURRENCY & STRESS TEST ==================
+Test 1: Producer bursts (100 events in rapid succession)...
+  -> Passed. 64 queued, 36 dropped on overflow, drained cleanly.
+Test 2: Delayed consumer (consumer sleeping while producer writes)...
+  -> Passed. Delayed consumer drained all 30 backlog events.
+Test 3: Buffer full capacity enforcement...
+  -> Passed. Buffer strictly capped at 64; 16 dropped.
+Test 4: Concurrent producer and consumer...
+  -> Passed. All 50 concurrent events safely produced and consumed.
+Test 5: Producer during notification reset...
+  -> Passed. Notification reset cleanly and second event was delivered.
+Test 6: Event loop shutdown safety...
+  -> Passed. Push succeeded safely with no attached loop.
+Test 7: Consumer task cancellation...
+  -> Passed. Consumer cancelled cleanly; active_consumer_count == 0.
+Test 8: Repeated start/stop lifecycles (10 iterations)...
+  -> Passed. 10 clean lifecycle cycles completed with zero leaks.
+Test 9: Shutdown with pending data in queue...
+  -> Passed. Pending data preserved and drained on shutdown.
+Test 10: Invariant verification (active_consumer_count <= 1)...
+  -> Passed. Invariant active_consumer_count <= 1 strictly enforced.
+=====================================================================
+>>> ALL 10 QUEUE CONCURRENCY SCENARIOS VERIFIED SUCCESSFULLY! <<<

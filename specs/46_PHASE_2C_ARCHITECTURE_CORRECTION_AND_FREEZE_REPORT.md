@@ -70,6 +70,10 @@ The audit examined five existing architecture documents and three primary implem
 | **P2C-25** | Medium | Lifecycle | Teardown allowed runtime thread to unhook the hook, violating Win32 thread ownership rules; `thread.join(timeout=1.0)` assumed successful termination without verifying `thread.is_alive()`. |
 | **P2C-26** | High | Security/Crypto | VS Code IPC mutual authentication failed to bind the complete session transcript (version, endpoint, PIDs, creation ticks, logon SID, nonces). |
 | **P2C-27** | Medium | Security/Protocol | VS Code operation allowlist had inconsistent naming and included `provider.shutdown`. |
+| **P2C-28** | Critical | Security/IPC | Named-Pipe Owner Rights ACE `(A;;GA;;;OW)` granted full control to the object owner (`TokenOwner` = User SID), permitting same-user cross-session access expansion and granting `FILE_CREATE_PIPE_INSTANCE` (0x0004) and `WRITE_DAC` (0x40000). |
+| **P2C-29** | High | Concurrency/Dispatch | WinEvent hook callback used blocking lock acquisition `with _queue_lock:`, risking message-pump stalls under consumer contention. |
+| **P2C-30** | Critical | Security/Crypto | HMAC transcript lacked deterministic canonical binary wire serialization, omitted server creation ticks and Logon SID, and used ad-hoc HMAC instead of RFC 5869 HKDF-SHA256. |
+| **P2C-31** | Medium | Methodology/Evidentiary | Acceptance gate table labeled all gates simply `PASS`, failing to distinguish between verified design/documentation, implementation-verified tests, and un-implemented Phase 2C code. |
 
 ---
 
@@ -395,27 +399,68 @@ The audit examined five existing architecture documents and three primary implem
 
 ---
 
+### 5.28 Finding P2C-28: Named-Pipe Owner Rights ACE & Cross-Session Isolation Mitigation
+- **Original Flaw**: The SDDL `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)` granted `GA` (`0x1F01FF`) to `OW` (Owner Rights SID `S-1-3-4`), claiming it belonged exclusively to the Presence server. In Windows security, newly created objects inherit their owner from the creating token's `TOKEN_OWNER`, which is the user account SID (`S-1-5-21-...`). The Logon SID cannot be set as object owner because it lacks `SE_GROUP_OWNER` (`ERROR_INVALID_OWNER`, 1307). Granting `GA` to `OW` allowed any process under the same user account in any logon session to obtain `FILE_CREATE_PIPE_INSTANCE` (0x0004) and `WRITE_DAC` (0x40000).
+- **Corrective Decision**:
+  1. Restrict Owner Rights ACE strictly to **`READ_CONTROL`**: `(A;;RC;;;OW)`.
+  2. This strips the owner's default implicit `WRITE_DAC` (0x00040000), withholds `FILE_CREATE_PIPE_INSTANCE` (0x00000004), and blocks same-user cross-session processes from connecting or altering the DACL.
+  3. Client and server data-exchange access is granted strictly through the active interactive Logon SID: `(A;;0x12019b;;;<LogonSID>)`.
+  4. Final hardened SDDL: `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)`.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.29 Finding P2C-29: Non-Blocking WinEvent Callback Synchronization
+- **Original Flaw**: The hook callback used blocking lock acquisition (`with _queue_lock:`), conflicting with the requirement that the Win32 message pump callback remain strictly minimal and non-blocking.
+- **Corrective Decision**:
+  1. The hook callback uses **non-blocking lock acquisition** (`_queue_lock.acquire(blocking=False)`).
+  2. If the lock is held (consumer is actively draining the queue), the callback stores the event in an atomic single-slot fallback `_concurrency_fallback_event` without blocking.
+  3. The consumer drains both the raw deque and the fallback slot under lock before resetting `_notification_pending = False`.
+  4. Guarantees zero lost wakeups, bounded $O(1)$ memory, and prevents stalls in the Win32 message pump thread.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.30 Finding P2C-30: Canonical Binary Transcript Serialization & HKDF-SHA256
+- **Original Flaw**: The mutual authentication transcript $T$ was defined as a Python tuple or string concatenation without explicit binary wire format encoding, omitted server creation ticks and Logon SID, and used ad-hoc HMAC.
+- **Corrective Decision**:
+  1. Defined deterministic canonical binary wire serialization for $T$ using network byte order (big-endian) integers and explicit 2-byte length-prefixed strings.
+  2. Bound bidirectional process-instance identities: both `(server_pid, server_creation_filetime_ticks, server_logon_sid)` and `(client_pid, client_creation_filetime_ticks, client_logon_sid)`.
+  3. Adopted standard HKDF-SHA256 (RFC 5869) for pseudorandom key extraction and domain-separated key expansion.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.31 Finding P2C-31: Acceptance Gate Status & Evidence Classification
+- **Original Flaw**: The architectural acceptance gate table labeled every gate simply `PASS`, creating confusion between verified design documentation, empirical implementation tests, and unimplemented Phase 2C runtime code.
+- **Corrective Decision**:
+  1. Standardized acceptance statuses: `PASS — DOCUMENTATION VERIFIED`, `PASS — IMPLEMENTATION VERIFIED`, `DESIGN ONLY`.
+  2. Clearly separated Phase 2B.1 verified test evidence (107 baseline, 88 adversarial, zero leaks across 30 cycles) from Phase 2C architecture (DESIGN ONLY).
+- **Classification**: **CORRECTED**.
+
+---
+
 ## 6. Cross-Specification Consistency Matrix
 
-All seven architecture specifications were audited together to ensure total cross-document alignment:
+All nine architecture specifications were audited together to ensure total cross-document alignment:
 
-| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Alignment Verdict |
-|---|---|---|---|---|---|---|---|---|:---:|
-| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | **CONSISTENT** |
-| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | **CONSISTENT** |
-| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | **CONSISTENT** |
-| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | **CONSISTENT** |
-| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | **CONSISTENT** |
-| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | **CONSISTENT** |
-| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | **CONSISTENT** |
-| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | **CONSISTENT** |
-| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | **CONSISTENT** |
-| **Named Pipe DACL Hardening**| Logon SID only; withhold 0x4| D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)| N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21 | Sec 9-11 | Sec 5 | **CONSISTENT** |
-| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | **CONSISTENT** |
-| **Bounded WinEvent Coalescing**| Pending <= 1; 8 counters| Threat T-01 | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24 | Sec 21-24 | Sec 8 | **CONSISTENT** |
-| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | **CONSISTENT** |
-| **Transcript HMAC Auth**| Bound T; domain labels | Bound T; domain labels | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26 | Sec 13-16 | Sec 10 | **CONSISTENT** |
-| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | **CONSISTENT** |
+| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Alignment Verdict |
+|---|---|---|---|---|---|---|---|---|---|:---:|
+| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | Sec 8 | **CONSISTENT** |
+| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | Sec 8 | **CONSISTENT** |
+| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
+| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | Sec 8 | **CONSISTENT** |
+| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
+| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
+| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | Sec 4 | **CONSISTENT** |
+| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Named Pipe DACL & Owner Rights**| D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)| RC to OW; Logon SID only | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21/28 | Sec 9-11 | Sec 5 | Sec 4-5 | **CONSISTENT** |
+| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | Sec 6 | **CONSISTENT** |
+| **Non-Blocking WinEvent Coalescing**| Try-lock + fallback slot | Threat T-01 bounded | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24/29 | Sec 21-24 | Sec 8 | Sec 7 | **CONSISTENT** |
+| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | Sec 8 | **CONSISTENT** |
+| **Binary Transcript HKDF Auth**| Canonical binary T; HKDF-SHA256 | Bidirectional peer identity; HKDF | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26/30 | Sec 13-16 | Sec 10 | Sec 9-11 | **CONSISTENT** |
+| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 12 | **CONSISTENT** |
 
 ---
 
@@ -438,6 +483,7 @@ The implementation roadmap is frozen into six sequential subphases:
       │       - WinEventHookThread dedicated message pump (GetMessageW / TranslateMessage / DispatchMessageW)
       │       - SetWinEventHook(EVENT_SYSTEM_FOREGROUND) out-of-context hook
       │       - Reentrancy guard (_in_callback) and non-blocking bounded deque (maxlen=50)
+      │       - Non-blocking lock acquisition (_queue_lock.acquire(blocking=False)) with fallback slot
       │       - Single-pending-notification coalescing mechanism (_notification_pending, pending <= 1)
       │       - Instrumentation counters (raw_events_received, coalesced, dropped, scheduled, executed)
       │       - GetForegroundWindow, GetWindowTextW (cached caption), GetClassNameW
@@ -472,10 +518,10 @@ The implementation roadmap is frozen into six sequential subphases:
       ▼
   Phase 2C.5: Application-Specific Context Provider Foundation
               - VS Code Integration: 4-layer authenticated named pipe architecture
-                (DACL: D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>), no User SID, withhold 0x0004;
+                (DACL: D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>), owner restricted to RC, no User SID, withhold 0x0004;
                  dwOpenMode: 0x40080003, dwPipeMode: 0x00000008;
-                 PID, Code.exe path, creation ticks, token Logon SID verification;
-                 Transcript-bound mutual HMAC-SHA256 challenge-response;
+                 Bidirectional PID, Code.exe path, creation ticks, token Logon SID verification;
+                 Canonical binary transcript-bound mutual HKDF-SHA256 challenge-response;
                  Canonical vscode.* allowlist; provider.shutdown prohibited)
               - Windows Terminal: Option C opt-in shell integration hook contract
               - Provider isolation: Class B 500 ms timeouts; graceful fallback to window metadata
@@ -489,28 +535,28 @@ Every gate from Section 14 has been rigorously evaluated against the corrected s
 
 | Gate | Architecture Dimension | Requirement & Acceptance Condition | Evaluation | Status |
 |---|---|---|---|:---:|
-| **Gate A** | Baseline Verification | Current branch and repository baseline verified. | Branch `architecture/phase-2c-api-ipc-resource-correction` and baseline `7f3ea10` confirmed. | **PASS — VERIFIED** |
-| **Gate B** | Cross-Session ACL | DACL no longer grants unnecessary cross-session access. | Broad User SID ACE removed; client access restricted strictly to caller's Logon SID. | **PASS** |
-| **Gate C** | Pipe Instance Authority | Client cannot create additional pipe instances. | Client ACE `0x0012019B` strictly withholds `FILE_CREATE_PIPE_INSTANCE` (`0x0004`). | **PASS** |
-| **Gate D** | Parameter Layout | Named-pipe flags appear in the correct API parameters. | `dwOpenMode` (0x40080003) and `dwPipeMode` (0x00000008) strictly separated. | **PASS** |
-| **Gate E** | Remote Client Rejection | Remote-client rejection remains enforced. | `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) passed in `dwPipeMode` to `CreateNamedPipeW`. | **PASS** |
-| **Gate F** | Raw FILETIME Identity | FILETIME identity remains raw integer ticks. | Canonical representation is `process_creation_filetime_ticks: int`; raw equality comparison. | **PASS** |
-| **Gate G** | Integer Datetime Conversion | Human-readable FILETIME conversion avoids float precision loss. | Conversion uses pure integer arithmetic (`unix_100ns // 10`) and `timedelta(microseconds=...)`. | **PASS** |
-| **Gate H** | Bounded Asyncio Backlog | Asyncio notification backlog is bounded. | Single-pending-notification mechanism maintains `pending_notification_count <= 1`. | **PASS** |
-| **Gate I** | Bounded Raw Queue | Raw event queue remains bounded. | `collections.deque(maxlen=50)` with overflow dropping oldest event. | **PASS** |
-| **Gate J** | Event Accounting | Event coalescing and dropped-event accounting are defined. | 8 explicit instrumentation counters defined (`raw_events_received`, `events_coalesced`, etc.). | **PASS** |
-| **Gate K** | Minimal Hook Callback | Callback remains minimal and reentrancy-safe. | `_in_callback` flag guard; non-blocking queuing; zero caption queries or disk I/O in hook proc. | **PASS** |
-| **Gate L** | Hook Ownership | Hook creation and destruction ownership are unambiguous. | Both `SetWinEventHook` and `UnhookWinEvent` executed strictly by `WinEventHookThread`. | **PASS** |
-| **Gate M** | Teardown Failure Reporting | Shutdown timeout cannot be misreported as successful termination. | If `thread.join(1.0)` times out, reports `HookShutdownTimeoutError` and logs telemetry. | **PASS** |
-| **Gate N** | Transcript HMAC Auth | Client and server authenticate the complete HMAC transcript. | Transcript $T$ binds version, endpoint, PIDs, ticks, logon SID, nonces with domain labels. | **PASS** |
-| **Gate O** | Secret Storage Safety | Pairing secrets are excluded from command lines, logs and environment variables. | User-mediated pairing (`presence vscode-pair`) into DPAPI / VS Code `SecretStorage`. | **PASS** |
-| **Gate P** | Process Image Validation | Process identity verification is accurately described. | Path checked via `QueryFullProcessImageNameW`, ticks via `GetProcessTimes`, token via `TokenGroups`. | **PASS** |
-| **Gate Q** | Canonical Allowlist | VS Code operation allowlist is consistent and least-privilege. | Canonical `vscode.*` namespace; `provider.shutdown` strictly prohibited; read-only metadata only. | **PASS** |
-| **Gate R** | Resource Budgets | Resource targets and acceptance ceilings are consistent. | All resource tables unified with Design Targets vs Acceptance Ceilings; 7 experiments (A-G). | **PASS** |
-| **Gate S** | Test Evidence Status | Test evidence is accurately classified. | Exact commands documented; unittest passed; lifecycle evidence accurately labeled. | **PASS — VERIFIED** |
-| **Gate T** | Mutual Consistency | Specifications 41–48 are mutually consistent. | Consistency matrix verified across all 8 specifications with zero contradictions. | **PASS** |
-| **Gate U** | Implementation Invariant | No production runtime or test implementation files were modified. | Verified: 100% documentation milestone; zero changes to `runtime/` or `tests/`. | **PASS — VERIFIED** |
-| **Gate V** | Clean Git State | Git commit exists and working tree is clean. | Staged and committed with clean working tree. | **PASS — VERIFIED** |
+| **Gate A** | Baseline Verification | Current branch and repository baseline verified. | Branch `architecture/phase-2c-api-ipc-resource-correction` and baseline `7f3ea10` confirmed. | **PASS — IMPLEMENTATION VERIFIED** |
+| **Gate B** | Cross-Session ACL | DACL no longer grants unnecessary cross-session access. | Broad User SID ACE removed; Owner Rights restricted strictly to `READ_CONTROL` (`(A;;RC;;;OW)`). | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate C** | Pipe Instance Authority | Client cannot create additional pipe instances. | Client ACE `0x0012019B` and Owner Rights ACE strictly withhold `FILE_CREATE_PIPE_INSTANCE` (`0x0004`). | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate D** | Parameter Layout | Named-pipe flags appear in the correct API parameters. | `dwOpenMode` (0x40080003) and `dwPipeMode` (0x00000008) strictly separated. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate E** | Remote Client Rejection | Remote-client rejection remains enforced. | `PIPE_REJECT_REMOTE_CLIENTS` (0x00000008) passed in `dwPipeMode` to `CreateNamedPipeW`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate F** | Raw FILETIME Identity | FILETIME identity remains raw integer ticks. | Canonical representation is `process_creation_filetime_ticks: int`; raw equality comparison. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate G** | Integer Datetime Conversion | Human-readable FILETIME conversion avoids float precision loss. | Conversion uses pure integer arithmetic (`unix_100ns // 10`) and `timedelta(microseconds=...)`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate H** | Bounded Asyncio Backlog | Asyncio notification backlog is bounded. | Single-pending-notification mechanism maintains `pending_notification_count <= 1`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate I** | Bounded Raw Queue | Raw event queue remains bounded. | `collections.deque(maxlen=50)` with overflow dropping oldest event. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate J** | Event Accounting | Event coalescing and dropped-event accounting are defined. | 8 explicit instrumentation counters defined (`raw_events_received`, `events_coalesced`, etc.). | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate K** | Minimal Hook Callback | Callback remains minimal and non-blocking. | `_in_callback` flag guard; non-blocking `acquire(blocking=False)` with fallback slot. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate L** | Hook Ownership | Hook creation and destruction ownership are unambiguous. | Both `SetWinEventHook` and `UnhookWinEvent` executed strictly by `WinEventHookThread`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate M** | Teardown Failure Reporting | Shutdown timeout cannot be misreported as successful termination. | If `thread.join(1.0)` times out, reports `HookShutdownTimeoutError` and logs telemetry. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate N** | Transcript HMAC Auth | Client and server authenticate the complete HMAC transcript. | Canonical binary transcript $T$ binds version, endpoint, bidirectional PIDs, ticks, SIDs, nonces with HKDF-SHA256. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate O** | Secret Storage Safety | Pairing secrets are excluded from command lines, logs and environment variables. | User-mediated pairing (`presence vscode-pair`) into DPAPI / VS Code `SecretStorage`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate P** | Process Image Validation | Process identity verification is accurately described. | Path checked via `QueryFullProcessImageNameW`, ticks via `GetProcessTimes`, token via `TokenGroups`. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate Q** | Canonical Allowlist | VS Code operation allowlist is consistent and least-privilege. | Canonical `vscode.*` namespace; `provider.shutdown` strictly prohibited; read-only metadata only. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate R** | Resource Budgets | Resource targets and acceptance ceilings are consistent. | All resource tables unified with Design Targets vs Acceptance Ceilings; 7 experiments (A-G). | **DESIGN ONLY** |
+| **Gate S** | Test Evidence Status | Test evidence is accurately classified. | Exact commands documented; unittest passed on Phase 2B.1; Phase 2C recognized as DESIGN ONLY. | **PASS — IMPLEMENTATION VERIFIED** |
+| **Gate T** | Mutual Consistency | Specifications 41–49 are mutually consistent. | Consistency matrix verified across all 9 specifications with zero contradictions. | **PASS — DOCUMENTATION VERIFIED** |
+| **Gate U** | Implementation Invariant | No production runtime or test implementation files were modified. | Verified: 100% documentation milestone; zero changes to `runtime/` or `tests/`. | **PASS — IMPLEMENTATION VERIFIED** |
+| **Gate V** | Clean Git State | Git commit exists and working tree is clean. | Staged and committed with clean working tree. | **PASS — IMPLEMENTATION VERIFIED** |
 
 **All 22 Architectural Acceptance Gates (Gates A through V) are PASS.**
 

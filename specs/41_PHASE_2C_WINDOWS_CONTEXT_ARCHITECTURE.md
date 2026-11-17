@@ -239,20 +239,30 @@ To establish a strictly bounded, reentrancy-safe pipeline:
 1. **Zero Expensive Work in Callback**: The callback does **NOT** query window captions, inspect process images, allocate memory dynamically, make COM calls, or perform disk I/O.
 2. **Reentrancy Guard**: An atomic reentrancy flag (`_in_callback`) drops nested callback invocations immediately.
 3. **Bounded Raw Queue**: The callback places a compact tuple `(hwnd, time.monotonic())` into a thread-safe bounded queue (`collections.deque(maxlen=50)`). Overflow drops the oldest event to preserve the latest foreground state.
-4. **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
-   - Maintains an atomic/synchronized state flag: `_notification_pending: bool = False`.
+4. **Single-Pending-Notification / Non-Blocking Coalescing Mechanism (P2C-24, P2C-29)**:
+   - Maintains synchronized state flags: `_notification_pending: bool = False`, `_shutdown_requested: bool = False`.
+   - Native callback uses **non-blocking lock acquisition** (`state.lock.acquire(blocking=False)`) to guarantee the Win32 message pump thread never stalls.
    - When an event arrives:
-     * Appends to `_raw_event_queue`. If queue was full (50 items), oldest item is evicted; `events_dropped` is incremented.
-     * Checks `_notification_pending`:
-       - If `_notification_pending` is `True`: increments `events_coalesced`; does **not** schedule another callback.
-       - If `_notification_pending` is `False`: sets `_notification_pending = True`; increments `notification_callbacks_scheduled`; dispatches a single notification via `loop.call_soon_threadsafe(manager._on_hook_event)`.
-5. **AsyncIO Consumer Draining**:
+     * If `state.lock.acquire(blocking=False)` succeeds:
+       - Appends to `_raw_event_queue` (`deque(maxlen=50)`). Evicts oldest item if full, incrementing `events_dropped`.
+       - If `_notification_pending` is `False`: sets `_notification_pending = True`, increments `notification_callbacks_scheduled`, and dispatches notification via `loop.call_soon_threadsafe(manager._on_hook_event)`.
+       - If `_notification_pending` is `True`: increments `events_coalesced`; does **not** schedule duplicate callbacks.
+       - Releases lock.
+     * If lock acquisition fails (consumer thread is currently draining queue):
+       - Atomically assigns event tuple to single-slot fallback `state.concurrency_fallback_event`.
+       - Increments `events_coalesced` and returns immediately without blocking.
+5. **AsyncIO Consumer Draining & Race Elimination**:
    - In `manager._on_hook_event`:
+     * Acquires `state.lock`.
+     * Drains all items from `_raw_event_queue` and clears the deque.
+     * Drains `state.concurrency_fallback_event` if non-None, resetting it to `None`.
+     * Resets `_notification_pending = False`.
      * Increments `notification_callbacks_executed`.
-     * Drains all queued items from `_raw_event_queue` under lock.
-     * Resets `_notification_pending = False` under lock.
-     * Takes the latest event, applies 150 ms debouncing, and triggers snapshot update.
-6. **Bounded Invariant**: `pending_notification_count <= 1` at all times. The asyncio event loop never accumulates a backlog of notification callbacks.
+     * Releases `state.lock`.
+     * Processes latest foreground event outside the lock.
+6. **Bounded Invariants**:
+   - `pending_notification_count <= 1` at all times.
+   - Lock hold duration inside callback is $O(1)$ memory manipulation; callback never stalls on asyncio execution.
 
 ```python
 class WinEventCallbackState:
@@ -263,6 +273,8 @@ class WinEventCallbackState:
         self.lock = threading.Lock()
         self.in_callback = False
         self.notification_pending = False
+        self.shutdown_requested = False
+        self.concurrency_fallback_event = None
         # Instrumentation counters
         self.raw_events_received = 0
         self.events_coalesced = 0
@@ -277,25 +289,39 @@ def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventT
         return
         
     state = _GLOBAL_HOOK_STATE
-    if state.in_callback:
-        return  # Drop reentrant calls
+    if state.in_callback or state.shutdown_requested:
+        return  # Drop reentrant calls or post-shutdown events
         
     state.in_callback = True
     try:
         now_mono = time.monotonic()
-        with state.lock:
-            state.raw_events_received += 1
-            if len(state.queue) == state.queue.maxlen:
-                state.events_dropped += 1
-            state.queue.append((hwnd, now_mono))
-            state.queue_high_water_mark = max(state.queue_high_water_mark, len(state.queue))
-            
-            if not state.notification_pending:
-                state.notification_pending = True
-                state.notification_callbacks_scheduled += 1
-                state.loop.call_soon_threadsafe(state.on_event)
-            else:
-                state.events_coalesced += 1
+        event_tuple = (hwnd, dwmsEventTime, now_mono)
+        state.raw_events_received += 1
+
+        # Non-blocking lock acquisition (P2C-29)
+        if state.lock.acquire(blocking=False):
+            try:
+                if len(state.queue) == state.queue.maxlen:
+                    state.events_dropped += 1
+                state.queue.append(event_tuple)
+                state.queue_high_water_mark = max(state.queue_high_water_mark, len(state.queue))
+                
+                if not state.notification_pending:
+                    state.notification_pending = True
+                    state.notification_callbacks_scheduled += 1
+                    try:
+                        state.loop.call_soon_threadsafe(state.on_event)
+                    except RuntimeError:
+                        state.notification_pending = False
+                else:
+                    state.events_coalesced += 1
+            finally:
+                state.lock.release()
+        else:
+            # Lock contention: consumer is currently draining state.queue.
+            # Store in atomic single-slot fallback so consumer picks it up before releasing lock.
+            state.concurrency_fallback_event = event_tuple
+            state.events_coalesced += 1
     finally:
         state.in_callback = False
 ```
@@ -334,54 +360,63 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
 [VS Code Extension Client]
 ```
 
-### 7.1 Transport Security, DACL Hardening & Parameter Placement (P2C-21, P2C-22)
+### 7.1 Transport Security, DACL Hardening & Parameter Placement (P2C-21, P2C-22, P2C-28)
 - **Pipe Naming**: `\\.\pipe\presence-vscode-<username>-<logon_session_id>`. Scoped to the interactive logon session.
-- **Hardened DACL (P2C-21)**:
-  * Security Descriptor string: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`
-  * Owner (Presence server) receives `GENERIC_ALL` (`GA` / `0x1F01FF`), granting creation, administration, and full control.
-  * Connected client (VS Code) receives strictly specific data-exchange rights under its **Logon SID**:
+- **Hardened DACL & Owner Rights Mitigation (P2C-21, P2C-28)**:
+  * Security Descriptor string: `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)`
+  * **Owner Rights Restriction (`OW`)**: On Windows, newly created objects inherit their owner from the creating token's `TOKEN_OWNER` (the user account SID `S-1-5-21-...`, not the Logon SID or process handle). The Logon SID cannot be set as `TOKEN_OWNER` because it lacks the `SE_GROUP_OWNER` attribute (attempting to set `O:<LogonSID>` fails with Win32 error 1307 `ERROR_INVALID_OWNER`).
+  * Granting `GA` to `OW` would grant full administrative access to *any* process running under the same user account in any logon session. Instead, Presence places an explicit Owner Rights ACE restricted to **`READ_CONTROL`** (`(A;;RC;;;OW)`). This strips the owner's default implicit `WRITE_DAC` (`0x00040000`), withholds `FILE_CREATE_PIPE_INSTANCE` (`0x00000004`), and denies data read/write to same-user cross-session processes.
+  * Connected client (and server) receive data-exchange rights strictly through the active interactive **Logon SID**:
     `0x0012019B` (`FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE`).
-  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from the client ACE. The client cannot create additional server instances of the pipe.
-  * **Cross-Session Isolation**: The broad User SID grant (`(A;;GRGW;;;<UserSID>)`) is **completely removed**. Processes running under the same user account in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) possess different Logon SIDs and are rejected by Windows kernel security (`STATUS_ACCESS_DENIED`).
+  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from both the Logon SID ACE and the Owner Rights ACE. Neither client nor owner can spawn duplicate server instances.
+  * **Cross-Session Isolation**: Broad User SID grant is eliminated. Processes running in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) match only `OW` and receive `READ_CONTROL` only; connection for IPC data exchange is denied (`STATUS_ACCESS_DENIED`).
   * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES` prevents handle inheritance by child processes.
 - **Accurate `CreateNamedPipeW` Parameter Placement (P2C-22)**:
   * `dwOpenMode`:
-    `PIPE_ACCESS_DUPLEX (0x00000003) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x00080000) | FILE_FLAG_OVERLAPPED (0x40000000)`
+    `PIPE_ACCESS_DUPLEX (0x00000003) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x00080000) | FILE_FLAG_OVERLAPPED (0x40000000)` = `0x40080003`
     - `FILE_FLAG_FIRST_PIPE_INSTANCE` (`0x00080000`) guarantees that Presence creates the pipe. If a squatting pipe already exists, `CreateNamedPipeW` fails immediately with `ERROR_ACCESS_DENIED`. The server fails closed.
   * `dwPipeMode`:
-    `PIPE_TYPE_BYTE (0x00000000) | PIPE_READMODE_BYTE (0x00000000) | PIPE_REJECT_REMOTE_CLIENTS (0x00000008) | PIPE_WAIT (0x00000000)`
+    `PIPE_TYPE_BYTE (0x00000000) | PIPE_READMODE_BYTE (0x00000000) | PIPE_REJECT_REMOTE_CLIENTS (0x00000008) | PIPE_WAIT (0x00000000)` = `0x00000008`
     - `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`) strictly blocks SMB/network clients at the NPFS kernel driver level.
     - Byte mode (`PIPE_TYPE_BYTE`) provides robust cross-platform streaming compatibility with Node.js / libuv, avoiding message-mode edge cases.
 
-### 7.2 OS Peer Verification & Transcript-Bound Mutual Authentication (P2C-26)
-1. **OS Peer Identity Verification**:
-   - `GetNamedPipeClientProcessId(hPipe, &client_pid)`
-   - `GetNamedPipeClientSessionId(hPipe, &client_session)`
-   - `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, client_pid)`
-   - `QueryFullProcessImageNameW`: verifies image path matches authentic `Code.exe` (or `Code - Insiders.exe`) under approved installation paths (`%LOCALAPPDATA%\Programs\Microsoft VS Code` or `%PROGRAMFILES%\Microsoft VS Code`).
-   - `GetProcessTimes`: captures `client_creation_filetime_ticks: int` to guard against PID recycling.
-   - `OpenProcessToken` + `GetTokenInformation(TokenGroups)`: asserts client token contains server's Logon SID.
-2. **Short-Lived Pairing Flow**:
-   - Explicit user-mediated command: `presence vscode-pair`.
-   - Generates a 256-bit pairing secret (`secrets.token_hex(32)`), TTL = 5 minutes, single-use.
-   - Secret is entered directly by the user into the VS Code extension UI; stored in VS Code `SecretStorage` (backed by Windows DPAPI / Credential Manager).
-   - In Presence, stored in user-scoped DPAPI vault.
-   - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-3. **Bound Mutual HMAC-SHA256 Challenge-Response**:
-   - Server sends `AUTH_CHALLENGE`: 32-byte cryptographically secure random `server_nonce` (hex).
-   - Client generates 32-byte `client_nonce` (hex).
-   - **Transcript Authentication**: Both parties construct the canonical transcript string:
-     `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
-   - Client sends `AUTH_RESPONSE`:
-     `client_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_CLIENT_AUTH_V1|" + T.encode())`
-   - Server verifies `client_mac` using constant-time comparison (`secrets.compare_digest`).
-   - Server returns `AUTH_CONFIRM`:
-     `server_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SERVER_AUTH_V1|" + T.encode())`
-   - Client independently verifies `server_mac` using `secrets.compare_digest`.
-   - Ephemeral session key is derived:
-     `session_key = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`
+### 7.2 Peer Process Identity & Canonical Transcript HMAC Authentication (P2C-26, P2C-30)
+1. **Bidirectional OS Peer Identity Verification**:
+   - Both peers verify each other's full process-instance identity via kernel queries:
+     * Server queries Client: `GetNamedPipeClientProcessId(hPipe, &client_pid)`, client binary image path via `QueryFullProcessImageNameW`, creation timestamp via `GetProcessTimes(&client_creation_filetime_ticks)`, and client token Logon SID via `OpenProcessToken` + `GetTokenInformation`.
+     * Client queries Server: `GetNamedPipeServerProcessId(hPipe, &server_pid)`, server binary image path, creation timestamp via `GetProcessTimes(&server_creation_filetime_ticks)`, and server token Logon SID.
+2. **Short-Lived Pairing Flow (`presence vscode-pair`)**:
+   - Explicit user-mediated command generates a 256-bit pairing secret ($K_{\text{pair}}$).
+   - Stored in VS Code `SecretStorage` (DPAPI) and Presence credential vault (DPAPI).
+   - **Never** exposed via command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
+3. **Canonical Binary Transcript Serialization ($T$) (P2C-30)**:
+   The handshake transcript $T$ is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian):
+   ```
+   [4 bytes] protocol_version (uint32_be = 0x00000001)
+   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, max 256)
+   [4 bytes] server_pid (uint32_be)
+   [8 bytes] server_creation_filetime_ticks (uint64_be)
+   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII, max 128)
+   [4 bytes] client_pid (uint32_be)
+   [8 bytes] client_creation_filetime_ticks (uint64_be)
+   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, max 128)
+   [32 bytes] server_nonce (raw random bytes)
+   [32 bytes] client_nonce (raw random bytes)
+   ```
+4. **Standard HKDF-SHA256 Key Derivation & Challenge-Response (RFC 5869)**:
+   - Server sends `AUTH_CHALLENGE`: 32-byte `server_nonce`.
+   - Client generates 32-byte `client_nonce`.
+   - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
+     $$\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
+   - Client sends `AUTH_RESPONSE` with `client_proof`:
+     $$\text{client\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"} \parallel T, 32)$$
+   - Server independently computes expected `client_proof` and verifies using constant-time `secrets.compare_digest`.
+   - Server returns `AUTH_CONFIRM` with `server_proof`:
+     $$\text{server\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"} \parallel T, 32)$$
+   - Client independently verifies `server_proof` using `secrets.compare_digest`.
+   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$):
+     $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$$
    - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
-   - Maximum 1 active client connection (`nMaxInstances = 1`). Handshake timeout 500 ms; disconnects immediately on verification failure.
 
 ### 7.3 Message Framing & Canonical Operation Allowlist (P2C-27)
 - **Framing**: Byte stream with 4-byte big-endian unsigned integer length prefix (`>I`), max frame 64 KB (`65536` bytes). Payloads exceeding 64 KB cause immediate connection termination.
@@ -396,7 +431,7 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
   * Ambient context is **never** sent to VS Code (unidirectional flow: VS Code metadata $\to$ Presence context).
   * No consent tokens can be minted or altered by the extension.
 - **Same-User Threat Boundary**:
-  Logon SID DACL + Image Verification + Creation Ticks + Transcript HMAC prevents network attackers, other Windows users, cross-session processes, pipe squatting, and un-paired local scripts. It does not defend against arbitrary malware executing inside the same user security context that has direct access to process memory (`OpenProcess(PROCESS_VM_READ)`). This boundary is explicitly acknowledged.
+  Logon SID DACL + Owner Rights Restriction (`RC` only) + Image Verification + Creation Ticks + Transcript HMAC prevents network attackers, other Windows users, cross-session processes, pipe squatting, and un-paired local scripts. It does not defend against arbitrary malware executing inside the same user security context that has direct access to process memory (`OpenProcess(PROCESS_VM_READ)`). This boundary is explicitly acknowledged.
 
 ---
 

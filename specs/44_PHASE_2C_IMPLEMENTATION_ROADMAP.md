@@ -73,12 +73,15 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - Implement `ForegroundWindowSource` using `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`.
   - Dedicate `WinEventHookThread` with Win32 message pump (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`).
   - Implement hook callback reentrancy guard (`_in_callback` flag) and compact event queuing (`collections.deque(maxlen=50)`).
-  - Implement **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
-    * Synchronized state flag: `_notification_pending: bool = False`.
-    * Native callback appends to raw queue (overflow drops oldest event; increments `events_dropped`).
-    * If `_notification_pending` is True: increments `events_coalesced`; does not schedule another notification.
-    * If `_notification_pending` is False: sets `_notification_pending = True`; increments `notification_callbacks_scheduled`; dispatches via `loop.call_soon_threadsafe()`.
-    * Consumer drains all queued items under lock, processes latest foreground state, and resets `_notification_pending = False`.
+  - Implement **Non-Blocking Single-Pending-Notification / Coalescing Mechanism (P2C-24, P2C-29)**:
+    * Synchronized state flags: `_notification_pending: bool = False`, `_shutdown_requested: bool = False`.
+    * Native callback uses **non-blocking lock acquisition** (`_queue_lock.acquire(blocking=False)`) to guarantee the Win32 message pump thread never stalls.
+    * If lock acquired: appends to raw queue (overflow drops oldest event; increments `events_dropped`).
+      - If `_notification_pending` is False: sets `_notification_pending = True`; increments `notification_callbacks_scheduled`; dispatches via `loop.call_soon_threadsafe()`.
+      - If `_notification_pending` is True: increments `events_coalesced`; does not schedule duplicate notification.
+      - Releases lock.
+    * If lock acquisition fails (consumer thread currently draining queue): assigns event to single-slot fallback `_concurrency_fallback_event` without blocking.
+    * Consumer drains all queued items and fallback slot under lock, processes latest foreground state outside lock, and resets `_notification_pending = False`.
     * Guaranteed invariant: `pending_notification_count <= 1` at all times.
   - Instrumentation counters: `raw_events_received`, `events_coalesced`, `events_dropped`, `queue_high_water_mark`, `notification_callbacks_scheduled`, `notification_callbacks_executed`, `max_event_processing_delay`, `pending_notification_count`.
   - Retrieve top-level window caption via `GetWindowTextW` (User32 cached caption; no synthetic timeouts).
@@ -95,6 +98,14 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
   - `tests/adversarial/test_adv_context_debouncing.py`
   - `tests/adversarial/test_adv_hook_reentrancy.py`
   - `tests/adversarial/test_adv_hook_backpressure.py`
+  - `tests/adversarial/test_adv_hook_lock_contention.py`
+  - `tests/adversarial/test_adv_hook_consumer_delay.py`
+  - `tests/adversarial/test_adv_hook_scheduling_failure.py`
+  - `tests/adversarial/test_adv_hook_drain_race.py`
+  - `tests/adversarial/test_adv_hook_reset_race.py`
+  - `tests/adversarial/test_adv_hook_queue_overflow.py`
+  - `tests/adversarial/test_adv_hook_shutdown_pending.py`
+  - `tests/adversarial/test_adv_hook_repeated_lifecycle.py`
 - **Files Modified**:
   - `runtime/platform_win32.py` (Add User32/Kernel32 window inspection bindings)
   - `runtime/context/manager.py` (Register `ForegroundWindowSource`)
@@ -183,25 +194,26 @@ Each subphase has its own explicit scope, dependency boundaries, security gates,
 - **Scope**:
   - **VS Code Integration (Option C — P1-01, P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)**:
     * 4-Layer Authenticated Named Pipe Architecture:
-      - **Layer 1 (Transport Access Control & Parameter Separation)**:
+      - **Layer 1 (Transport Access Control, DACL Hardening & Owner Rights)**:
         * Pipe name `\\.\pipe\presence-vscode-<username>-<logon_session_id>`.
         * Parameter placement: `dwOpenMode` (`PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED` = `0x40080003`); `dwPipeMode` (`PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS | PIPE_WAIT` = `0x00000008`).
-        * Hardened DACL: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`. The broad User SID grant is **completely removed** to eliminate cross-session access expansion.
-        * Withholding instance authority: `FILE_CREATE_PIPE_INSTANCE` (`0x0004`) is **strictly withheld** from the client ACE (`0x0012019B`).
+        * Hardened DACL with Owner Rights restriction (P2C-28): `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)`.
+        * `OW` represents the object owner (`TokenOwner`, which is the user account SID). The Logon SID cannot be set as object owner (`ERROR_INVALID_OWNER`, 1307). Setting `(A;;RC;;;OW)` explicitly restricts the owner to `READ_CONTROL` (`0x20000`), stripping default implicit `WRITE_DAC` (`0x40000`), withholding `FILE_CREATE_PIPE_INSTANCE` (`0x0004`), and blocking same-user cross-session IPC access.
+        * Data read/write granted strictly via client ACE: `0x0012019B` to active interactive `LogonSID`.
+        * `FILE_CREATE_PIPE_INSTANCE` (`0x0004`) is strictly withheld from both client and owner ACEs.
         * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES`.
         * Fails closed with `ERROR_ACCESS_DENIED` if pipe squatting is detected.
-      - **Layer 2 (Peer Process Identity Verification)**:
-        * Server queries `GetNamedPipeClientProcessId()`.
-        * Verifies executable image path via `QueryFullProcessImageNameW()` against approved VS Code installation paths (`Code.exe` / `Code - Insiders.exe`).
-        * Queries `GetProcessTimes()` to obtain `client_creation_filetime_ticks: int` against PID recycling.
-        * Queries `OpenProcessToken()` and `GetTokenInformation(TokenGroups)` to assert identical client Logon SID.
-      - **Layer 3 (Pairing & Bound Transcript Mutual Authentication)**:
-        * Short-lived user pairing command: `presence vscode-pair` (256-bit secret, 5-minute TTL, single-use).
+      - **Layer 2 (Bidirectional Peer Process Identity Verification)**:
+        * Server queries `GetNamedPipeClientProcessId()`, executable image path via `QueryFullProcessImageNameW()`, creation ticks via `GetProcessTimes(&client_creation_filetime_ticks)`, and client token Logon SID.
+        * Client queries `GetNamedPipeServerProcessId()`, server binary path, creation ticks via `GetProcessTimes(&server_creation_filetime_ticks)`, and server token Logon SID.
+      - **Layer 3 (Pairing & Canonical Binary Transcript HKDF Mutual Authentication)**:
+        * Short-lived user pairing command: `presence vscode-pair` (256-bit secret $K_{\text{pair}}$, 5-minute TTL, single-use).
         * Stored in VS Code `SecretStorage` (DPAPI) and Presence user vault. Never passed in CLI args, env vars, history, or logs.
-        * Complete transcript binding:
-          `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
-        * Mutual challenge-response with domain separation labels (`PRESENCE_VSCODE_CLIENT_AUTH_V1` and `PRESENCE_VSCODE_SERVER_AUTH_V1`) and constant-time `secrets.compare_digest`.
-        * Ephemeral session key derived: `HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`.
+        * Canonical binary transcript serialization ($T$) using big-endian integers and length-prefixed strings:
+          `[uint32_be version][uint16_be ep_len + ep][uint32_be s_pid][uint64_be s_ticks][uint16_be s_sid_len + s_sid][uint32_be c_pid][uint64_be c_ticks][uint16_be c_sid_len + c_sid][32B s_nonce][32B c_nonce]`
+        * Standard HKDF-SHA256 (RFC 5869): $\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{nonces}, \text{IKM}=K_{\text{pair}})$.
+        * Mutual challenge-response: `client_proof` derived with `PRESENCE_VSCODE_CLIENT_AUTH_V1`; `server_proof` derived with `PRESENCE_VSCODE_SERVER_AUTH_V1`. Verified with `secrets.compare_digest`.
+        * Ephemeral session key derived: $K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$.
       - **Layer 4 (Framing, Payload Bounds & Canonical Operation Allowlist)**:
         * 4-byte big-endian length prefix (`>I`), hard 64 KB (`65536` bytes) payload ceiling.
         * Canonical operation allowlist: `vscode.ping`, `vscode.get_active_workspace`, `vscode.get_active_editor_metadata`, `vscode.get_open_documents`.

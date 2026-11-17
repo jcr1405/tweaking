@@ -190,22 +190,28 @@ In accordance with Presence engineering principles, mature open-source projects,
 
 ---
 
-### ADR-2C-12: Authenticated Local Named Pipe IPC for Developer Context (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27)
+### ADR-2C-12: Authenticated Local Named Pipe IPC for Developer Context (P2C-19, P2C-21, P2C-22, P2C-26, P2C-27, P2C-28, P2C-30)
 - **Status**: **APPROVED**
 - **Context**: Developer tools like VS Code hold valuable context (active workspace, open files, language). Unauthenticated or ambient IPC introduces severe security risks: pipe squatting, cross-session access expansion, unauthorized model steering, and data harvesting.
 - **Decision**: Implement a 4-layer authenticated named pipe IPC architecture for VS Code context extraction:
-  1. **Transport Access Control & Parameter Separation (P2C-21, P2C-22)**:
+  1. **Transport Access Control & Owner Rights Mitigation (P2C-21, P2C-22, P2C-28)**:
      - Pipe name `\\.\pipe\presence-vscode-<username>-<logon_session_id>`.
-     - `dwOpenMode`: `PIPE_ACCESS_DUPLEX (0x3) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x80000) | FILE_FLAG_OVERLAPPED (0x40000000)`. Fails closed if squatted.
-     - `dwPipeMode`: `PIPE_TYPE_BYTE (0x0) | PIPE_READMODE_BYTE (0x0) | PIPE_REJECT_REMOTE_CLIENTS (0x8) | PIPE_WAIT (0x0)`. Rejects remote clients at NPFS kernel level.
-     - Hardened DACL: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`. Broad User SID grant is completely removed, eliminating cross-session access expansion.
+     - `dwOpenMode`: `PIPE_ACCESS_DUPLEX (0x3) | FILE_FLAG_FIRST_PIPE_INSTANCE (0x80000) | FILE_FLAG_OVERLAPPED (0x40000000)` = `0x40080003`. Fails closed if squatted.
+     - `dwPipeMode`: `PIPE_TYPE_BYTE (0x0) | PIPE_READMODE_BYTE (0x0) | PIPE_REJECT_REMOTE_CLIENTS (0x8) | PIPE_WAIT (0x0)` = `0x00000008`. Rejects remote clients at NPFS kernel level.
+     - Hardened DACL: `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)`.
+     - `OW` represents the object owner (`TokenOwner`, which is the user account SID). The Logon SID cannot be set as object owner (`ERROR_INVALID_OWNER`, 1307). Setting `(A;;RC;;;OW)` explicitly restricts the owner to `READ_CONTROL` (`0x20000`), stripping default implicit `WRITE_DAC` (`0x40000`), withholding `FILE_CREATE_PIPE_INSTANCE` (`0x0004`), and blocking same-user cross-session IPC access.
      - Client rights: `0x0012019B` strictly withholds `FILE_CREATE_PIPE_INSTANCE` (`0x0004`).
      - `bInheritHandle = FALSE` prevents child process inheritance.
-  2. **Peer Process Identity Verification**: Server obtains client PID via `GetNamedPipeClientProcessId()`, validates executable path via `QueryFullProcessImageNameW()` against `Code.exe`, captures process creation ticks via `GetProcessTimes()`, and asserts client token Logon SID matches server Logon SID.
-  3. **Application Pairing & Bound Transcript Mutual Authentication (P2C-26)**:
-     - User-mediated pairing command: `presence vscode-pair` (256-bit secret, 5-minute TTL, single-use, DPAPI-protected, no secrets in CLI flags/env vars/logs).
-     - Full transcript binding: `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`.
-     - Domain separation labels: `PRESENCE_VSCODE_CLIENT_AUTH_V1` and `PRESENCE_VSCODE_SERVER_AUTH_V1`. Constant-time digest verification (`secrets.compare_digest`). Ephemeral session key derived.
+  2. **Bidirectional Peer Process Identity Verification (P2C-30)**:
+     - Server queries client PID via `GetNamedPipeClientProcessId()`, validates executable path via `QueryFullProcessImageNameW()` against `Code.exe`, captures process creation ticks via `GetProcessTimes()`, and asserts client token Logon SID matches server Logon SID.
+     - Client queries server PID via `GetNamedPipeServerProcessId()`, validates server executable path, creation ticks, and token Logon SID.
+  3. **Application Pairing & Canonical Binary Transcript HKDF Mutual Authentication (P2C-26, P2C-30)**:
+     - User-mediated pairing command: `presence vscode-pair` (256-bit secret $K_{\text{pair}}$, 5-minute TTL, single-use, DPAPI-protected, no secrets in CLI flags/env vars/logs).
+     - Canonical binary transcript serialization ($T$) using network byte order (big-endian) integers and length-prefixed strings:
+       `[uint32_be version][uint16_be ep_len + ep][uint32_be s_pid][uint64_be s_ticks][uint16_be s_sid_len + s_sid][uint32_be c_pid][uint64_be c_ticks][uint16_be c_sid_len + c_sid][32B s_nonce][32B c_nonce]`
+     - Standard HKDF-SHA256 (RFC 5869): $\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{nonces}, \text{IKM}=K_{\text{pair}})$.
+     - Mutual challenge-response: `client_proof` derived with `PRESENCE_VSCODE_CLIENT_AUTH_V1`; `server_proof` derived with `PRESENCE_VSCODE_SERVER_AUTH_V1`. Constant-time digest verification (`secrets.compare_digest`).
+     - Ephemeral session key derived: $K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$.
   4. **Framing, Payload Bounds & Canonical Operation Allowlist (P2C-27)**:
      - 4-byte big-endian length prefix; 64 KB hard max payload ceiling.
      - Canonical operation allowlist: `vscode.ping`, `vscode.get_active_workspace`, `vscode.get_active_editor_metadata`, `vscode.get_open_documents`.
@@ -213,9 +219,10 @@ In accordance with Presence engineering principles, mature open-source projects,
 - **Alternatives Considered**:
   - *Local HTTP Server (localhost)*: Vulnerable to DNS rebinding and cross-site scripting port scanning. Rejected.
   - *Broad User SID DACL*: Permits cross-session access to other logon sessions of the same account. Rejected.
+  - *Granting GENERIC_ALL to OW*: Grants full control to any process in any logon session under the same user. Rejected.
   - *Granting GENERIC_WRITE to client*: Grants `FILE_CREATE_PIPE_INSTANCE` (0x0004). Rejected.
   - *Unbound Nonce Challenge*: Fails to bind process identities and endpoint to authentication proof. Rejected.
-- **Technical Justification**: Combining Logon SID DACL with specific rights withholding 0x0004, first-instance flag, remote rejection, process identity verification, and transcript-bound HMAC provides maximum practical defense-in-depth on Windows.
+- **Technical Justification**: Combining Logon SID DACL with Owner Rights restricted to `READ_CONTROL`, specific rights withholding 0x0004, first-instance flag, remote rejection, process identity verification, and canonical binary transcript HKDF provides maximum practical defense-in-depth on Windows.
 - **Security Consequences**: Prevents cross-session eavesdropping, pipe squatting, replay attacks, and instance creation attacks.
 - **Resource Consequences**: Ephemeral IPC connection queried only on window focus change. Timeout capped at 500 ms. Minimal RAM footprint (< 50 KB).
 - **Limitations**: Medium-integrity processes executing within the same interactive user session could theoretically inspect process memory. This boundary is explicitly documented.
@@ -223,31 +230,34 @@ In accordance with Presence engineering principles, mature open-source projects,
   - [Named Pipe Security and Access Rights](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
   - [CreateNamedPipeW function (namedpipeapi.h)](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)
   - [GetNamedPipeClientProcessId function (winbase.h)](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid)
+  - [Owner of a New Object](https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object)
+  - [SID Strings (OW / Owner Rights SID)](https://learn.microsoft.com/en-us/windows/win32/secauthz/sid-strings)
 
 ---
 
-### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Bounded Dispatch Model (P2C-20, P2C-24, P2C-25)
+### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Bounded Dispatch Model (P2C-20, P2C-24, P2C-25, P2C-29)
 - **Status**: **APPROVED**
-- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, hook destruction ownership must belong strictly to the installing thread.
+- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, blocking locks in native callbacks stall the message pump, and hook destruction ownership must belong strictly to the installing thread.
 - **Decision**:
   1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
   2. Implement reentrancy guard (`_in_callback` flag) and bounded raw queue (`collections.deque(maxlen=50)`).
-  3. Implement **Single-Pending-Notification / Coalescing Mechanism (P2C-24)**:
-     - Atomic/synchronized flag `_notification_pending: bool`.
-     - Callback appends event to raw deque (overflow drops oldest event; increments `events_dropped`).
-     - If `_notification_pending` is True, increments `events_coalesced` and suppresses additional scheduling.
-     - If `_notification_pending` is False, sets flag to True and schedules `loop.call_soon_threadsafe(state.on_event)`.
-     - Consumer drains raw deque, processes latest event, and resets flag to False.
+  3. Implement **Non-Blocking Single-Pending-Notification / Coalescing Mechanism (P2C-24, P2C-29)**:
+     - Synchronized state flag `_notification_pending: bool`.
+     - Native callback uses non-blocking lock acquisition (`state.lock.acquire(blocking=False)`).
+     - If lock acquired: appends event to raw deque (overflow drops oldest event; increments `events_dropped`). If `_notification_pending` is False, sets flag to True and schedules `loop.call_soon_threadsafe(state.on_event)`. If True, increments `events_coalesced`.
+     - If lock not acquired (consumer draining queue): stores event into single-slot fallback `state.concurrency_fallback_event` without blocking.
+     - Consumer drains raw deque and fallback slot under lock, processes latest event outside lock, and resets flag to False.
      - Invariant: `pending_notification_count <= 1` at all times.
   4. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
      - `UnhookWinEvent(self._hHook)` is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
      - Runtime thread joins hook thread with 1.0s timeout. If alive after timeout, reports `HookShutdownTimeoutError` (do not claim clean termination).
   5. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
+  - *Blocking lock acquisition in hook proc*: Stalls the Win32 message pump during consumer contention. Rejected.
   - *Scheduling notification on every event*: Floods asyncio event loop with unbounded callbacks during Alt-Tab storms. Rejected.
   - *Unhooking from runtime thread*: Violates Win32 thread affinity for hooks, introducing race conditions. Rejected.
   - *Assuming thread termination on timeout*: Masked hung thread bugs. Rejected.
-- **Technical Justification**: Separating minimal event queuing from single-pending-notification asyncio handoff guarantees an end-to-end bounded dispatch pipeline ($O(1)$ memory).
+- **Technical Justification**: Non-blocking try-lock with fallback slot guarantees the native hook callback is strictly non-blocking ($O(1)$) while ensuring zero lost wakeups and bounding asyncio callback queues.
 - **Security Consequences**: Prevents UI stuttering and eliminates denial-of-service vectors against the desktop message loop.
 - **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 50 in deque and exactly 1 pending notification callback.
 - **Limitations**: Dropping oldest events during Alt-Tab bursts prioritizes the latest foreground window state.
@@ -273,11 +283,11 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-09** | Terminology | Job Objects = Process Lifecycle Containment | Accurate Windows OS security taxonomy (not a security sandbox) |
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
-| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & bound transcript HMAC | Logon SID only; withhold 0x0004; parameter separation; transcript HMAC; canonical allowlist |
-| **ADR-2C-13** | Hook Model | Coalesced WinEvent dispatch & owner teardown | Single-pending notification (`<= 1`); owner unhooks; timeout failure reporting |
+| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & binary transcript HKDF | Owner restricted to `RC`; Logon SID only; withhold 0x0004; canonical binary transcript; HKDF |
+| **ADR-2C-13** | Hook Model | Non-blocking WinEvent dispatch & owner teardown | Non-blocking try-lock; fallback slot; single-pending notification (`<= 1`); owner unhooks |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specification 46, Specification 47, and Specification 48.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specification 46, Specification 47, Specification 48, and Specification 49.

@@ -152,48 +152,68 @@ Communication between the Presence Runtime and developer extensions (such as the
     `PIPE_TYPE_BYTE (0x00000000) | PIPE_READMODE_BYTE (0x00000000) | PIPE_REJECT_REMOTE_CLIENTS (0x00000008) | PIPE_WAIT (0x00000000)`
     - `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`) strictly blocks network and SMB clients at the Windows NPFS kernel driver level.
     - Byte mode (`PIPE_TYPE_BYTE`) provides streaming compatibility with Node.js / libuv in VS Code, avoiding Windows message-mode edge cases.
-- **Hardened DACL (P2C-21)**:
-  * Security Descriptor string: `D:P(A;;GA;;;OW)(A;;0x12019b;;;<LogonSID>)`
-  * Owner (Presence server) receives `GENERIC_ALL` (`GA` / `0x1F01FF`), granting creation, administration, and full control.
+- **Hardened DACL & Owner Rights Mitigation (P2C-21, P2C-28)**:
+  * Security Descriptor string: `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)`
+  * **Owner Rights Restriction (`OW`)**: On Windows, newly created objects inherit their owner from the creating token's `TOKEN_OWNER` (the user account SID `S-1-5-21-...`, not the Logon SID or process handle). The Logon SID cannot be set as `TOKEN_OWNER` because it lacks the `SE_GROUP_OWNER` attribute (attempting to set `O:<LogonSID>` fails with Win32 error 1307 `ERROR_INVALID_OWNER`).
+  * Granting `GA` to `OW` would grant full administrative access to *any* process running under the same user account in any logon session. Instead, Presence places an explicit Owner Rights ACE restricted to **`READ_CONTROL`** (`(A;;RC;;;OW)`). This strips the owner's default implicit `WRITE_DAC` (`0x00040000`), withholds `FILE_CREATE_PIPE_INSTANCE` (`0x00000004`), and denies data read/write to same-user cross-session processes.
   * Client (VS Code) receives strictly specific data-exchange rights under its **Logon SID**:
     `0x0012019B` (`FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_EA | FILE_WRITE_EA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE`).
-  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from the client ACE. The client cannot create additional server instances of the pipe.
-  * **Cross-Session Isolation**: The broad User SID grant (`(A;;GRGW;;;<UserSID>)`) is **completely removed**. Processes running under the same user account in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) possess different Logon SIDs and are rejected by Windows kernel security (`STATUS_ACCESS_DENIED`).
+  * **Withholding Pipe-Instance Creation Authority**: `FILE_CREATE_PIPE_INSTANCE` (`FILE_APPEND_DATA`, `0x0004`) is **strictly withheld** from both the Logon SID ACE and the Owner Rights ACE. The client cannot create additional server instances of the pipe.
+  * **Cross-Session Isolation**: The broad User SID grant (`(A;;GRGW;;;<UserSID>)`) is **completely removed**. Processes running under the same user account in different logon sessions (e.g. secondary desktop, SSH, or elevated RunAs) match only `OW` and receive `READ_CONTROL` only; connection for IPC data exchange is denied (`STATUS_ACCESS_DENIED`).
   * `bInheritHandle = FALSE` in `SECURITY_ATTRIBUTES` prevents handle inheritance by child processes.
 - **Pipe Naming**: `\\.\pipe\presence-vscode-<username>-<logon_session_id>`. Scoped to the interactive logon session.
 
-### 5.2 Layer 2: OS Peer Identity Verification
-Upon client connection (`ConnectNamedPipe`), the server verifies:
-1. `GetNamedPipeClientProcessId(hPipe, &client_pid)`: Retrieves caller PID.
-2. `GetNamedPipeClientSessionId(hPipe, &client_session)`: Verifies caller belongs to the interactive session.
-3. Open process with `PROCESS_QUERY_LIMITED_INFORMATION`:
-   - `QueryFullProcessImageNameW`: Verifies executable image matches approved VS Code installation path (`Code.exe` / `Code - Insiders.exe`). Note: Documented as defense-in-depth, as unprivileged same-user processes can rename binaries.
-   - `GetProcessTimes`: Captures `client_creation_filetime_ticks: int` to bind session to the exact process instance, preventing PID recycling attacks.
-4. `OpenProcessToken` with `TOKEN_QUERY`:
-   - Calls `GetTokenInformation(TokenGroups)` to verify the client's token contains the server's Logon SID.
-5. Impersonation Check: Uses `ImpersonateNamedPipeClient` to inspect the token, then **always** calls `RevertToSelf` in a guaranteed `try/finally` block. Never executes Presence operations while impersonating.
+### 5.2 Layer 2: Bidirectional OS Peer Identity Verification (P2C-30)
+Upon client connection (`ConnectNamedPipe`), both endpoints independently verify each other's operating system identity:
+1. Server verifies Client:
+   - `GetNamedPipeClientProcessId(hPipe, &client_pid)`: Retrieves caller PID.
+   - `GetNamedPipeClientSessionId(hPipe, &client_session)`: Verifies caller belongs to the interactive session.
+   - Open client process with `PROCESS_QUERY_LIMITED_INFORMATION`:
+     * `QueryFullProcessImageNameW`: Verifies executable image matches approved VS Code installation path (`Code.exe` / `Code - Insiders.exe`). Note: Documented as defense-in-depth, as unprivileged same-user processes can rename binaries.
+     * `GetProcessTimes`: Captures `client_creation_filetime_ticks: int` to bind session to the exact process instance, preventing PID recycling attacks.
+   - `OpenProcessToken` with `TOKEN_QUERY`:
+     * Calls `GetTokenInformation(TokenGroups)` to verify the client's token contains the server's Logon SID.
+   - Impersonation Check: Uses `ImpersonateNamedPipeClient` to inspect the token, then **always** calls `RevertToSelf` in a guaranteed `try/finally` block. Never executes Presence operations while impersonating.
+2. Client verifies Server:
+   - `GetNamedPipeServerProcessId(hPipe, &server_pid)`: Retrieves server PID.
+   - Opens server process with `PROCESS_QUERY_LIMITED_INFORMATION`, queries image name and `server_creation_filetime_ticks: int`.
+   - Queries server token for matching Logon SID.
 
-### 5.3 Layer 3: Application Authentication via Bound Transcript HMAC (P2C-26)
+### 5.3 Layer 3: Application Authentication via Canonical Binary Transcript & HKDF-SHA256 (P2C-26, P2C-30)
 Because multiple processes or same-user tools can run simultaneously, OS checks are supplemented with cryptographic mutual authentication binding the entire connection transcript:
-1. **Short-Lived Pairing Flow**:
+1. **Short-Lived Pairing Flow (`presence vscode-pair`)**:
    - Initiated via explicit user command: `presence vscode-pair`.
-   - Generates single-use 256-bit pairing secret (`secrets.token_hex(32)`), TTL = 5 minutes.
+   - Generates single-use 256-bit pairing secret ($K_{\text{pair}}$), TTL = 5 minutes.
    - User enters secret directly into VS Code extension UI; extension stores secret in VS Code `context.secrets` (`SecretStorage`, backed by Windows DPAPI / Credential Manager).
    - In Presence, stored in user-scoped DPAPI credential store.
    - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-2. **Transcript-Bound Mutual Authentication**:
-   - Server issues fresh 32-byte cryptographically secure random `server_nonce` (hex).
-   - Client generates 32-byte `client_nonce` (hex).
-   - Both parties construct the canonical transcript string:
-     `T = f"2.0|{pipe_endpoint}|{server_pid}|{client_pid}|{client_creation_filetime_ticks}|{client_logon_sid}|{server_nonce}|{client_nonce}"`
-   - Client sends `AUTH_RESPONSE`:
-     `client_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_CLIENT_AUTH_V1|" + T.encode())`
-   - Server verifies `client_mac` using constant-time comparison (`secrets.compare_digest`).
-   - Server replies with `AUTH_CONFIRM`:
-     `server_mac = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SERVER_AUTH_V1|" + T.encode())`
-   - Client independently verifies `server_mac` using `secrets.compare_digest`.
-   - Ephemeral session key is derived:
-     `session_key = HMAC-SHA256(pairing_key, b"PRESENCE_VSCODE_SESSION_KEY_V1|" + T.encode())`
+2. **Canonical Binary Transcript Serialization ($T$) (P2C-30)**:
+   The transcript is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian):
+   ```
+   [4 bytes] protocol_version (uint32_be = 0x00000001)
+   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, max 256)
+   [4 bytes] server_pid (uint32_be)
+   [8 bytes] server_creation_filetime_ticks (uint64_be)
+   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII, max 128)
+   [4 bytes] client_pid (uint32_be)
+   [8 bytes] client_creation_filetime_ticks (uint64_be)
+   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, max 128)
+   [32 bytes] server_nonce (raw random bytes)
+   [32 bytes] client_nonce (raw random bytes)
+   ```
+3. **Standard HKDF-SHA256 Key Derivation & Challenge-Response (RFC 5869)**:
+   - Server issues fresh 32-byte cryptographically secure random `server_nonce`.
+   - Client generates 32-byte `client_nonce`.
+   - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
+     $$\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
+   - Client sends `AUTH_RESPONSE` with `client_proof`:
+     $$\text{client\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"} \parallel T, 32)$$
+   - Server independently computes expected `client_proof` and verifies using constant-time `secrets.compare_digest`.
+   - Server replies with `AUTH_CONFIRM` with `server_proof`:
+     $$\text{server\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"} \parallel T, 32)$$
+   - Client independently verifies `server_proof` using `secrets.compare_digest`.
+   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$):
+     $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$$
    - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
    - Handshake timeout is 500 ms. Maximum 1 active client connection (`nMaxInstances = 1`). Disconnects immediately on failure.
 

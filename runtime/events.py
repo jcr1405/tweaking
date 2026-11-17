@@ -35,6 +35,10 @@ class Event:
 
 EventHandler = Callable[[Event], None]
 
+# Environmental Context Event Types (Phase 2C)
+WINDOW_FOREGROUND_CHANGED = "WindowForegroundChanged"
+CONTEXT_SNAPSHOT_CREATED = "ContextSnapshotCreated"
+
 
 class EventBus:
     """Thread-safe, error-isolated in-memory event bus."""

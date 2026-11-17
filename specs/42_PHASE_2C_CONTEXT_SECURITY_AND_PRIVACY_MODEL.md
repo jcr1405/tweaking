@@ -187,8 +187,8 @@ Because multiple processes or same-user tools can run simultaneously, OS checks 
    - User enters secret directly into VS Code extension UI; extension stores secret in VS Code `context.secrets` (`SecretStorage`, backed by Windows DPAPI / Credential Manager).
    - In Presence, stored in user-scoped DPAPI credential store.
    - **Never** passed through command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-2. **Canonical Binary Transcript Serialization ($T$) (P2C-30)**:
-   The transcript is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian):
+2. **Canonical Binary Transcript Serialization ($T$) & Validation (P2C-30, P2C-34)**:
+   The transcript is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit exceptions:
    ```
    [4 bytes] protocol_version (uint32_be = 0x00000001)
    [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, max 256)
@@ -200,20 +200,26 @@ Because multiple processes or same-user tools can run simultaneously, OS checks 
    [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, max 128)
    [32 bytes] server_nonce (raw random bytes)
    [32 bytes] client_nonce (raw random bytes)
+   [4 bytes] max_payload_bytes (uint32_be = 65536)
    ```
-3. **Standard HKDF-SHA256 Key Derivation & Challenge-Response (RFC 5869)**:
+3. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34)**:
    - Server issues fresh 32-byte cryptographically secure random `server_nonce`.
    - Client generates 32-byte `client_nonce`.
    - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
-     $$\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
-   - Client sends `AUTH_RESPONSE` with `client_proof`:
-     $$\text{client\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"} \parallel T, 32)$$
+     $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
+   - Both endpoints derive separate, purpose-specific keys via HKDF-Expand:
+     $$\begin{aligned}
+     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
+     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
+     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"}, 32)
+     \end{aligned}$$
+   - Client calculates authentication proof and sends `AUTH_RESPONSE`:
+     $$\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$$
    - Server independently computes expected `client_proof` and verifies using constant-time `secrets.compare_digest`.
    - Server replies with `AUTH_CONFIRM` with `server_proof`:
-     $$\text{server\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"} \parallel T, 32)$$
+     $$\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$$
    - Client independently verifies `server_proof` using `secrets.compare_digest`.
-   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$):
-     $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$$
+   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$).
    - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
    - Handshake timeout is 500 ms. Maximum 1 active client connection (`nMaxInstances = 1`). Disconnects immediately on failure.
 

@@ -268,30 +268,54 @@ For all process identity, window focus verification, and Time-of-Check to Time-o
 
 ---
 
-## 8. Final Bounded WinEvent Dispatch Model (P2C-24 & P2C-29)
+## 8. Final Bounded WinEvent Dispatch Model (P2C-24, P2C-29 & P2C-33)
 
-### 8.1 The Dual-Queue Hazard
+### 8.1 The Dual-Queue Hazard and Task Accumulation
 In desktop automation, an event hook produces high-frequency burst events (e.g. holding Alt-Tab switches windows dozens of times per second).
-Previous architectures bounded the raw deque (`maxlen=50`), but invoked `loop.call_soon_threadsafe(_notify_event_available)` on every single event.
-If the asyncio event loop was delayed (e.g. running intensive async tasks), the asyncio loop callback queue would accumulate hundreds of pending callbacks, defeating memory bounds and creating CPU spikes.
+Previous architectures bounded the raw deque (`maxlen=50`), but invoked `loop.call_soon_threadsafe(_notify_event_available)` or `asyncio.create_task` on every event or drain cycle.
+If the asyncio event loop was delayed (e.g. running intensive async tasks), detached tasks accumulated without bound, defeating memory bounds and creating CPU spikes. Furthermore, try-lock models with fallback slots introduced a race window during consumer drain.
 
-### 8.2 Non-Blocking Try-Lock & Single-Pending Coalescing Architecture (P2C-29)
-In Win32 User32 architecture, the `WinEventProc` callback is invoked on the thread running the message pump. If the callback attempts to acquire a blocking mutex (`with _queue_lock:`) while the consumer thread is actively draining the queue, the message pump thread will block. If the consumer yields or waits, a priority inversion or message pump stall occurs.
-
-Presence implements a strictly non-blocking try-lock mechanism with single-slot atomic fallback combined with single-pending-notification coalescing:
+### 8.2 SPSC Ring Buffer & Supervised Consumer Architecture (P2C-33)
+In Win32 User32 architecture, the `WinEventProc` callback is invoked on the thread running the message pump. To eliminate locks entirely from the hook thread, Presence implements a Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64) with wake-up coalescing (`pending_notification_count <= 1`) and a single supervised consumer task (`active_foreground_consumer_count <= 1`):
 
 $$\text{pending\_notification\_count} \le 1 \quad \forall t$$
+$$\text{active\_foreground\_consumer\_count} \le 1 \quad \forall t$$
 
 ```python
+import asyncio
 import collections
 import threading
 import time
 
-_in_callback = False
+class WinEventSPSCQueue:
+    def __init__(self, capacity: int = 64):
+        self.capacity = capacity
+        self.buffer = [None] * capacity
+        self.head = 0  # Consumer index
+        self.tail = 0  # Producer index
+
+    def push_nonblocking(self, event: tuple) -> bool:
+        """Called exclusively from hook thread. Never blocks."""
+        next_tail = (self.tail + 1) % self.capacity
+        if next_tail == self.head:
+            return False  # Buffer full; drop oldest or handle per policy
+        self.buffer[self.tail] = event
+        self.tail = next_tail
+        return True
+
+    def drain_all(self) -> list:
+        """Called exclusively from consumer task."""
+        events = []
+        while self.head != self.tail:
+            events.append(self.buffer[self.head])
+            self.head = (self.head + 1) % self.capacity
+        return events
+
+_spsc_queue = WinEventSPSCQueue(capacity=64)
+_event_available = asyncio.Event()
 _notification_pending = False
-_queue_lock = threading.Lock()
-_raw_event_queue = collections.deque(maxlen=50)
-_concurrency_fallback_event = None  # Atomic single-slot fallback for lock contention
+_in_callback = False
+_active_foreground_consumer_count = 0
 
 _counters = {
     "raw_events_received": 0,
@@ -302,64 +326,56 @@ _counters = {
     "notification_callbacks_executed": 0,
     "max_event_processing_delay": 0.0,
     "pending_notification_count": 0,
-    "fallback_events_recorded": 0,
+    "active_foreground_consumer_count": 0,
 }
 
 def hook_proc(hWinEventHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
-    global _in_callback, _notification_pending, _concurrency_fallback_event
+    global _in_callback, _notification_pending
     if _in_callback:
         return  # Drop nested reentrant event
     _in_callback = True
     try:
         if event == EVENT_SYSTEM_FOREGROUND and idObject == OBJID_WINDOW:
-            event_arrival_time = time.monotonic()
-            # P2C-29: Strictly non-blocking lock acquisition
-            acquired = _queue_lock.acquire(blocking=False)
-            if acquired:
-                try:
-                    _counters["raw_events_received"] += 1
-                    if len(_raw_event_queue) >= 50:
-                        _counters["events_dropped"] += 1
-                    _raw_event_queue.append((hwnd, dwmsEventTime, event_arrival_time))
-                    _counters["queue_high_water_mark"] = max(_counters["queue_high_water_mark"], len(_raw_event_queue))
-
-                    # Single-pending-notification coalescing
-                    if not _notification_pending:
-                        _notification_pending = True
-                        _counters["notification_callbacks_scheduled"] += 1
-                        _counters["pending_notification_count"] = 1
-                        loop.call_soon_threadsafe(_notify_event_available)
-                    else:
-                        _counters["events_coalesced"] += 1
-                finally:
-                    _queue_lock.release()
+            arrival_time = time.monotonic()
+            _counters["raw_events_received"] += 1
+            
+            pushed = _spsc_queue.push_nonblocking((hwnd, dwmsEventTime, arrival_time))
+            if not pushed:
+                _counters["events_dropped"] += 1
+            
+            # Wake-up coalescing: pending_notification_count <= 1
+            if not _notification_pending:
+                _notification_pending = True
+                _counters["notification_callbacks_scheduled"] += 1
+                _counters["pending_notification_count"] = 1
+                loop.call_soon_threadsafe(_event_available.set)
             else:
-                # Consumer is actively holding lock while draining.
-                # Record to atomic single-slot fallback without blocking the message loop!
-                _counters["raw_events_received"] += 1
-                _concurrency_fallback_event = (hwnd, dwmsEventTime, event_arrival_time)
-                _counters["fallback_events_recorded"] += 1
+                _counters["events_coalesced"] += 1
     finally:
         _in_callback = False
 
-def _notify_event_available():
-    global _notification_pending, _concurrency_fallback_event
-    with _queue_lock:
-        events = list(_raw_event_queue)
-        _raw_event_queue.clear()
-        if _concurrency_fallback_event is not None:
-            events.append(_concurrency_fallback_event)
-            _concurrency_fallback_event = None
-        _notification_pending = False
-        _counters["pending_notification_count"] = 0
-        _counters["notification_callbacks_executed"] += 1
-
-    if events:
-        latest_event = events[-1]
-        now = time.monotonic()
-        delay = now - latest_event[2]
-        _counters["max_event_processing_delay"] = max(_counters["max_event_processing_delay"], delay)
-        asyncio.create_task(process_foreground_event(latest_event))
+async def _foreground_consumer_worker():
+    """Single supervised consumer worker task."""
+    global _active_foreground_consumer_count, _notification_pending
+    _active_foreground_consumer_count = 1
+    _counters["active_foreground_consumer_count"] = 1
+    try:
+        while not _shutdown_event.is_set():
+            await _event_available.wait()
+            _event_available.clear()
+            _notification_pending = False
+            _counters["pending_notification_count"] = 0
+            
+            events = _spsc_queue.drain_all()
+            if events:
+                latest_event = events[-1]
+                _counters["notification_callbacks_executed"] += 1
+                delay = time.monotonic() - latest_event[2]
+                _counters["max_event_processing_delay"] = max(_counters["max_event_processing_delay"], delay)
+                await process_foreground_event(latest_event)
+    finally:
+        _active_foreground_consumer_count = 0
+        _counters["active_foreground_consumer_count"] = 0
 ```
 
 ### 8.3 Authoritative Telemetry Counters
@@ -416,6 +432,28 @@ def serialize_handshake_transcript(
     server_nonce: bytes,
     client_nonce: bytes,
 ) -> bytes:
+    # P2C-34: Strict field validation raising ValueError (no bare asserts)
+    if not isinstance(version, int) or version <= 0:
+        raise ValueError(f"Invalid version: {version}")
+    if not isinstance(endpoint, str) or not re.match(r"^\\\\\.\\pipe\\[A-Za-z0-9._-]+$", endpoint):
+        raise ValueError(f"Invalid named pipe endpoint: {endpoint}")
+    if not (0 <= server_pid <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid server_pid: {server_pid}")
+    if not (0 <= server_creation_ticks <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError(f"Invalid server_creation_ticks: {server_creation_ticks}")
+    if not isinstance(server_logon_sid, str) or not re.match(r"^S-1-5-5-\d+-\d+$", server_logon_sid):
+        raise ValueError(f"Invalid server_logon_sid: {server_logon_sid}")
+    if not (0 <= client_pid <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid client_pid: {client_pid}")
+    if not (0 <= client_creation_ticks <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError(f"Invalid client_creation_ticks: {client_creation_ticks}")
+    if not isinstance(client_logon_sid, str) or not re.match(r"^S-1-5-5-\d+-\d+$", client_logon_sid):
+        raise ValueError(f"Invalid client_logon_sid: {client_logon_sid}")
+    if not isinstance(server_nonce, (bytes, bytearray)) or len(server_nonce) != 32:
+        raise ValueError("server_nonce must be exactly 32 bytes")
+    if not isinstance(client_nonce, (bytes, bytearray)) or len(client_nonce) != 32:
+        raise ValueError("client_nonce must be exactly 32 bytes")
+
     ep_bytes = endpoint.encode("utf-8")
     s_sid_bytes = server_logon_sid.encode("utf-8")
     c_sid_bytes = client_logon_sid.encode("utf-8")
@@ -429,8 +467,8 @@ def serialize_handshake_transcript(
         client_pid,
         client_creation_ticks,
         len(c_sid_bytes), c_sid_bytes,
-        server_nonce,
-        client_nonce,
+        bytes(server_nonce),
+        bytes(client_nonce),
     )
 ```
 
@@ -442,23 +480,26 @@ SERVER_AUTH_LABEL  = b"PRESENCE_VSCODE_SERVER_AUTH_V1"
 SESSION_KEY_LABEL  = b"PRESENCE_VSCODE_SESSION_KEY_V1"
 ```
 
-### 10.3 RFC 5869 HKDF-SHA256 Protocol Flow
-Mutual challenge-response and session key derivation follow standard RFC 5869 HKDF-SHA256:
+### 10.3 RFC 5869 HKDF-SHA256 Protocol Flow & HMAC Proofs (P2C-34)
+Mutual challenge-response separates key derivation from authentication proof computation following RFC 5869 HKDF-SHA256 and RFC 2104 HMAC-SHA256:
 
 1. **Server Challenge**: Server sends 32-byte `server_nonce = secrets.token_bytes(32)`.
-2. **Client Challenge & Digest**: Client generates 32-byte `client_nonce = secrets.token_bytes(32)`. Both parties extract the Pseudorandom Key:
+2. **Client Challenge & Key Derivation**: Client generates 32-byte `client_nonce = secrets.token_bytes(32)`. Both parties extract the Pseudorandom Key:
    $$\text{PRK} = \text{HKDF-Extract}(\text{salt} = \text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM} = K_{\text{pair}})$$
-   Client computes:
-   $$\text{client\_digest} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{CLIENT\_AUTH\_LABEL} \parallel T, L = 32)$$
-   Client sends `(client_nonce, client_digest)`.
-3. **Server Verification**: Server independently compiles $T$, computes expected digest, and verifies using constant-time comparison:
-   $$\text{secrets.compare\_digest}(\text{received\_client\_digest}, \text{expected\_client\_digest})$$
-4. **Server Digest**: Server computes:
-   $$\text{server\_digest} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{SERVER\_AUTH\_LABEL} \parallel T, L = 32)$$
-   Server sends `server_digest`.
-5. **Client Verification**: VS Code extension independently compiles $T$ and verifies `server_digest` using constant-time comparison before sending any workspace data.
-6. **Ephemeral Session Key Derivation**: Both parties derive the ephemeral session key:
-   $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{SESSION\_KEY\_LABEL} \parallel T, L = 32)$$
+   Both parties derive purpose-specific keys via HKDF-Expand:
+   - $K_{\text{client\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{CLIENT\_AUTH\_LABEL}, L = 32)$
+   - $K_{\text{server\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{SERVER\_AUTH\_LABEL}, L = 32)$
+   - $K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{SESSION\_KEY\_LABEL}, L = 32)$
+   Client computes authentication proof:
+   $$\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$$
+   Client sends `(client_nonce, client_proof)`.
+3. **Server Verification**: Server independently compiles $T$, computes expected client proof, and verifies using constant-time comparison:
+   $$\text{secrets.compare\_digest}(\text{received\_client\_proof}, \text{expected\_client\_proof})$$
+4. **Server Proof**: Server computes authentication proof:
+   $$\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$$
+   Server sends `server_proof`.
+5. **Client Verification**: VS Code extension independently compiles $T$ and verifies `server_proof` using constant-time comparison before sending any workspace data.
+6. **Ephemeral Session Key Use**: Both parties use $K_{\text{session}}$ for session security.
 
 ---
 
@@ -514,21 +555,21 @@ The IPC interface enforces a strict JSON-RPC method allowlist:
 
 ---
 
-## 13. Cross-Specification Consistency Matrix (Specs 41–49)
+## 13. Cross-Specification Consistency Matrix (Specs 41–50)
 
-| Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Status |
-|---|---|---|---|---|---|---|---|---|---|:---:|
-| **ShellExecute Flags (P2C-17)** | N/A | Zone checks preserved | Flag constants; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3 | Sec 3-4 | Sec 2 | **CONSISTENT** |
-| **Shell Execution Class (P2C-17)** | N/A | Class C async | Class C async; Python wrapper | Subphase 2C.4 | ADR-2C-10 | Sec 3.2 | Sec 4 | Sec 4 | Sec 2 | **CONSISTENT** |
-| **Canonical FILETIME (P2C-18)** | Raw ticks | WindowIdentity ticks | TOCTOU raw integer ticks | Subphase 2C.0/1 | ADR-2C-11 | Sec 3.3 | Sec 5 | Sec 7 | Sec 2 | **CONSISTENT** |
-| **Integer FILETIME Math (P2C-23)** | Integer formulas | N/A | Raw integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 6-7 | Sec 7 | Sec 2 | **CONSISTENT** |
-| **Pipe DACL & Owner Rights (P2C-21 & P2C-28)** | (A;;RC;;;OW) Logon SID only | SDDL 0x12019b; withhold 0x0004; OW RC | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.28 | Sec 10 | Sec 5 | Sec 4-6 | **CONSISTENT** |
-| **Pipe Parameter Separation (P2C-22)** | 0x40080003 vs 0x0008 | Fail-closed squatting defense | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 2 | **CONSISTENT** |
-| **Transcript HMAC & HKDF (P2C-26 & P2C-30)** | Canonical binary $T$; HKDF-SHA256 | Bidirectional peer IDs; HKDF-SHA256 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.26, 5.30 | Sec 13-16 | Sec 10-11 | Sec 9-11 | **CONSISTENT** |
-| **Canonical Allowlist (P2C-27)** | vscode.* allowlist | Prohibit provider.shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 2 | **CONSISTENT** |
-| **Non-Blocking WinEvent Dispatch (P2C-24 & P2C-29)** | Non-blocking try-lock; fallback slot | Threat T-01 queue bounded | N/A | Exp G; 8 counters; test matrix | ADR-2C-13 | Sec 5.24, 5.29 | Sec 22-23 | Sec 8 | Sec 7-8 | **CONSISTENT** |
-| **Owner Hook Teardown (P2C-25)** | Hook thread teardown | Timeout error reporting | N/A | Exp F join timeout | ADR-2C-13 | Sec 5.25 | Sec 21, 27 | Sec 9 | Sec 2 | **CONSISTENT** |
-| **Resource Budgets & Experiments** | Empirical budgets | Leak targets | Latency budgets | Exp A-G table | ADR-2C-13 | Sec 3.5 | Sec 25-27 | Sec 8, 14 | Sec 2 | **CONSISTENT** |
+| Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Status |
+|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **ShellExecute Flags (P2C-17)** | N/A | Zone checks preserved | Flag constants; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3 | Sec 3-4 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Shell Execution Class (P2C-17)** | N/A | Class C async | Class C async; Python wrapper | Subphase 2C.4 | ADR-2C-10 | Sec 3.2 | Sec 4 | Sec 4 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Canonical FILETIME (P2C-18)** | Raw ticks | WindowIdentity ticks | TOCTOU raw integer ticks | Subphase 2C.0/1 | ADR-2C-11 | Sec 3.3 | Sec 5 | Sec 7 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Integer FILETIME Math (P2C-23)** | Integer formulas | N/A | Raw integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 6-7 | Sec 7 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Pipe DACL & Owner Rights (P2C-21, 28, 32)** | (A;;RC;;;OW) Logon SID only | SDDL 0x12019b; withhold 0x0004; OW RC | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.28 | Sec 10 | Sec 5 | Sec 4-6 | Sec 3-6 | **CONSISTENT** |
+| **Pipe Parameter Separation (P2C-22)** | 0x40080003 vs 0x0008 | Fail-closed squatting defense | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 2 | Sec 3 | **CONSISTENT** |
+| **Transcript HMAC & HKDF (P2C-26, 30, 34)** | Canonical binary $T$; HKDF-SHA256 | Bidirectional peer IDs; HKDF-SHA256 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.26, 5.30 | Sec 13-16 | Sec 10-11 | Sec 9-11 | Sec 10-12 | **CONSISTENT** |
+| **Canonical Allowlist (P2C-27)** | vscode.* allowlist | Prohibit provider.shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Race-Free WinEvent Dispatch (P2C-24, 29, 33)** | SPSC buffer; single worker | Threat T-01 queue bounded | N/A | Exp G; 12 counters; test matrix | ADR-2C-13 | Sec 5.24, 5.29 | Sec 22-23 | Sec 8 | Sec 7-8 | Sec 7-9 | **CONSISTENT** |
+| **Owner Hook Teardown (P2C-25)** | Hook thread teardown | Timeout error reporting | N/A | Exp F join timeout | ADR-2C-13 | Sec 5.25 | Sec 21, 27 | Sec 9 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Resource Budgets & Experiments** | Empirical budgets | Leak targets | Latency budgets | Exp A-G table | ADR-2C-13 | Sec 3.5 | Sec 25-27 | Sec 8, 14 | Sec 2 | Sec 13 | **CONSISTENT** |
 
 ---
 

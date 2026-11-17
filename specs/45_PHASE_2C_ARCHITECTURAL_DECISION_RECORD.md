@@ -21,7 +21,7 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **`uiautomation` (yinkaisheng)** | Windows UI Automation | Maintained | Windows 10/11 (COM UIA) | Light COM wrapper | Tree traversal can freeze target applications | **ADAPT (TARGETED)**: Useful only for on-demand text inspection; rejected for default context. |
 | **Screenpipe** | Ambient Screen/Audio Capture | Active Rust codebase | Windows/macOS | Very heavy (Rust daemon, FFmpeg, SQLite, OCR) | Continuous recording violates Data Minimization | **REJECTED**: Incompatible with Presence zero-surveillance and lightweight invariants. |
 | **`psutil`** | Process & Resource Telemetry | Highly mature, standard | Windows 10/11 | Already verified in Presence runtime | Query limited process information | **REUSE**: Standardized process resource queries and handle telemetry. |
-| **Windows Notification Hook (`SetWinEventHook`)** | Ambient Window Changes | Core Windows OS | Windows 2000 to Windows 11 Build 26100 | Pure native Win32 | Out-of-context hook requires zero DLL injection | **REUSE / BUILD**: Provides 100% reactive, zero-polling desktop awareness. |
+| **Windows Notification Hook (`SetWinEventHook`)** | Ambient Window Changes | Core Windows OS | Windows 2000 to Windows 11 Build 26100 | Pure native Win32 | Out-of-context hook requires zero DLL injection | **REUSE / BUILD**: Provides event-driven, zero-polling desktop awareness. |
 
 ---
 
@@ -33,7 +33,7 @@ In accordance with Presence engineering principles, mature open-source projects,
 - **Decision**: Use `SetWinEventHook` with `EVENT_SYSTEM_FOREGROUND` (`0x0003`) and `WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS`.
 - **Top-Level Caption Semantics (P0-01)**: For top-level windows in other processes, `GetWindowTextW` retrieves the caption directly from the internal window structure in the desktop heap without sending cross-process `WM_GETTEXT` messages. No synthetic timeout wrappers are necessary for top-level captions.
 - **Consequences**:
-  - *Positive*: Pure event-driven notification from the Windows kernel. Zero CPU utilization when the desktop is static.
+  - *Positive*: Pure event-driven notification from the Windows kernel. Near-zero CPU utilization (< 0.05% design target, < 0.20% ceiling) when the desktop is static (thread enters kernel `GetMessageW` wait state).
   - *Positive*: Out-of-context hook avoids injecting DLLs into target processes, preventing antivirus heuristic alerts.
   - *Requirement*: Out-of-context hooks require a standard Win32 message pump on the installing thread. Handled via dedicated `WinEventHookThread`.
 
@@ -235,32 +235,33 @@ In accordance with Presence engineering principles, mature open-source projects,
 
 ---
 
-### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Bounded Dispatch Model (P2C-20, P2C-24, P2C-25, P2C-29)
+### ADR-2C-13: SetWinEventHook Resource, Lifecycle & Race-Free Bounded Dispatch Model (P2C-20, P2C-24, P2C-25, P2C-29, P2C-33)
 - **Status**: **APPROVED**
-- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, blocking locks in native callbacks stall the message pump, and hook destruction ownership must belong strictly to the installing thread.
+- **Context**: WinEvent hooks require a message loop, callbacks can be reentered, and notifying the asyncio event loop on every raw event creates an unbounded notification queue under burst conditions. Furthermore, blocking locks in native callbacks stall the message pump, and unsynchronized fallback slots risk lost wakeups. Hook destruction ownership must belong strictly to the installing thread, and processing tasks must remain bounded.
 - **Decision**:
   1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
-  2. Implement reentrancy guard (`_in_callback` flag) and bounded raw queue (`collections.deque(maxlen=50)`).
-  3. Implement **Non-Blocking Single-Pending-Notification / Coalescing Mechanism (P2C-24, P2C-29)**:
+  2. Implement reentrancy guard (`_in_callback` flag) and bounded Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64). Producer thread never blocks and never waits on consumer.
+  3. Implement **Wake-Up Coalescing & Supervised Single Consumer Worker (P2C-24, P2C-33)**:
      - Synchronized state flag `_notification_pending: bool`.
-     - Native callback uses non-blocking lock acquisition (`state.lock.acquire(blocking=False)`).
-     - If lock acquired: appends event to raw deque (overflow drops oldest event; increments `events_dropped`). If `_notification_pending` is False, sets flag to True and schedules `loop.call_soon_threadsafe(state.on_event)`. If True, increments `events_coalesced`.
-     - If lock not acquired (consumer draining queue): stores event into single-slot fallback `state.concurrency_fallback_event` without blocking.
-     - Consumer drains raw deque and fallback slot under lock, processes latest event outside lock, and resets flag to False.
-     - Invariant: `pending_notification_count <= 1` at all times.
+     - When producer pushes into ring buffer: if `_notification_pending` is False, sets flag to True and signals consumer via `loop.call_soon_threadsafe(self._event_available.set)`. If True, increments `events_coalesced`.
+     - Supervised single consumer worker task maintains invariant:
+       $$\text{active\_foreground\_consumer\_count} \le 1, \quad \text{pending\_notification\_count} \le 1 \quad \forall t$$
+     - Worker wakes on `_event_available.wait()`, clears the event, drains the ring buffer, selects the latest relevant foreground event, and processes it asynchronously outside synchronization boundaries.
   4. Implement **Owner-Controlled Teardown Lifecycle (P2C-25)**:
      - `UnhookWinEvent(self._hHook)` is executed strictly by `WinEventHookThread` upon receiving `WM_QUIT`.
      - Runtime thread joins hook thread with 1.0s timeout. If alive after timeout, reports `HookShutdownTimeoutError` (do not claim clean termination).
   5. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
   - *Blocking lock acquisition in hook proc*: Stalls the Win32 message pump during consumer contention. Rejected.
+  - *Unsynchronized fallback slot*: Introduces lost-wakeup race where events remain stranded after consumer drain. Rejected.
+  - *Creating detached task per event*: Causes unbounded task accumulation during slow coroutine processing. Rejected.
   - *Scheduling notification on every event*: Floods asyncio event loop with unbounded callbacks during Alt-Tab storms. Rejected.
   - *Unhooking from runtime thread*: Violates Win32 thread affinity for hooks, introducing race conditions. Rejected.
   - *Assuming thread termination on timeout*: Masked hung thread bugs. Rejected.
-- **Technical Justification**: Non-blocking try-lock with fallback slot guarantees the native hook callback is strictly non-blocking ($O(1)$) while ensuring zero lost wakeups and bounding asyncio callback queues.
+- **Technical Justification**: SPSC ring buffer with supervised single consumer worker guarantees the native hook callback is strictly non-blocking ($O(1)$) while ensuring zero lost wakeups, strictly bounding active processing tasks ($O(1)$), and bounding asyncio callback queues.
 - **Security Consequences**: Prevents UI stuttering and eliminates denial-of-service vectors against the desktop message loop.
-- **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 50 in deque and exactly 1 pending notification callback.
-- **Limitations**: Dropping oldest events during Alt-Tab bursts prioritizes the latest foreground window state.
+- **Resource Consequences**: Idle CPU drops to kernel wait. Burst events capped at 64 in ring buffer, exactly 1 pending notification callback, and exactly 1 active consumer task.
+- **Limitations**: Coalescing burst events prioritizes the latest foreground window state.
 - **Microsoft References**:
   - [SetWinEventHook function (winuser.h)](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook)
   - [Guarding Against Reentrancy in Hook Functions](https://learn.microsoft.com/en-us/windows/win32/winauto/guarding-against-reentrancy-in-hook-functions)
@@ -283,8 +284,8 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-09** | Terminology | Job Objects = Process Lifecycle Containment | Accurate Windows OS security taxonomy (not a security sandbox) |
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
-| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & binary transcript HKDF | Owner restricted to `RC`; Logon SID only; withhold 0x0004; canonical binary transcript; HKDF |
-| **ADR-2C-13** | Hook Model | Non-blocking WinEvent dispatch & owner teardown | Non-blocking try-lock; fallback slot; single-pending notification (`<= 1`); owner unhooks |
+| **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004; canonical transcript; separate HKDF keys + HMAC proofs |
+| **ADR-2C-13** | Hook Model | Race-free SPSC event dispatch & supervised worker | Non-blocking SPSC ring buffer; wake-up coalescing (`<= 1`); single consumer worker (`<= 1`); owner unhooks |
 
 ---
 

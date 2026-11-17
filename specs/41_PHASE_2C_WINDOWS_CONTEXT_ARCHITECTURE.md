@@ -298,35 +298,59 @@ def native_winevent_proc(hWinEventHook, event, hwnd, idObject, idChild, idEventT
         event_tuple = (hwnd, dwmsEventTime, now_mono)
         state.raw_events_received += 1
 
-        # Non-blocking lock acquisition (P2C-29)
-        if state.lock.acquire(blocking=False):
-            try:
-                if len(state.queue) == state.queue.maxlen:
-                    state.events_dropped += 1
-                state.queue.append(event_tuple)
-                state.queue_high_water_mark = max(state.queue_high_water_mark, len(state.queue))
-                
-                if not state.notification_pending:
-                    state.notification_pending = True
-                    state.notification_callbacks_scheduled += 1
-                    try:
-                        state.loop.call_soon_threadsafe(state.on_event)
-                    except RuntimeError:
-                        state.notification_pending = False
-                else:
-                    state.events_coalesced += 1
-            finally:
-                state.lock.release()
+        # Race-Free Event Dispatch via Bounded SPSC Ring Buffer (P2C-29 & P2C-33)
+        # Hook thread is the sole producer; pushes event into bounded ring buffer (maxlen=64)
+        if not state.ring_buffer.push(event_tuple):
+            state.events_dropped += 1
         else:
-            # Lock contention: consumer is currently draining state.queue.
-            # Store in atomic single-slot fallback so consumer picks it up before releasing lock.
-            state.concurrency_fallback_event = event_tuple
-            state.events_coalesced += 1
+            state.events_received += 1
+            # Single-pending wake-up coalescing for the supervised consumer worker
+            if not state.notification_pending:
+                state.notification_pending = True
+                state.notification_callbacks_scheduled += 1
+                try:
+                    state.loop.call_soon_threadsafe(state.signal_event_available)
+                except RuntimeError:
+                    state.notification_pending = False
+            else:
+                state.events_coalesced += 1
     finally:
         state.in_callback = False
 ```
 
-### 6.3 Owner-Controlled Unhooking & Teardown Protocol (P2C-25)
+### 6.3 Supervised Single-Consumer Worker Lifecycle (P2C-33)
+To guarantee that active asynchronous processing tasks remain strictly bounded ($O(1)$) and prevent task accumulation during slow coroutine execution, the runtime maintains exactly one supervised consumer worker task:
+
+$$\text{active\_foreground\_consumer\_count} \le 1 \quad \forall t$$
+
+```python
+async def _foreground_consumer_worker(self):
+    """Supervised single consumer worker for foreground window events."""
+    self.active_foreground_consumer_count = 1
+    try:
+        while not self._stopping:
+            await self._event_available.wait()
+            self._event_available.clear()
+            self.notification_pending = False
+            
+            # Drain batch from bounded SPSC buffer
+            events = self.ring_buffer.drain()
+            if not events:
+                continue
+                
+            # Coalesce intermediate rapid shifts: process only the latest foreground event
+            latest_event = events[-1]
+            try:
+                await self._process_foreground_event(latest_event)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error processing foreground event", exc_info=e)
+    finally:
+        self.active_foreground_consumer_count = 0
+```
+
+### 6.4 Owner-Controlled Unhooking & Teardown Protocol (P2C-25)
 In Win32 User32 architecture, `UnhookWinEvent` must be executed by the thread that installed the hook (`WinEventHookThread`). Allowing the runtime thread to unhook directly introduces race conditions and undefined handle destruction.
 
 The teardown sequence is strictly owner-controlled:
@@ -380,7 +404,7 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
     - `PIPE_REJECT_REMOTE_CLIENTS` (`0x00000008`) strictly blocks SMB/network clients at the NPFS kernel driver level.
     - Byte mode (`PIPE_TYPE_BYTE`) provides robust cross-platform streaming compatibility with Node.js / libuv, avoiding message-mode edge cases.
 
-### 7.2 Peer Process Identity & Canonical Transcript HMAC Authentication (P2C-26, P2C-30)
+### 7.2 Peer Process Identity & Canonical Transcript HMAC Authentication (P2C-26, P2C-30, P2C-34)
 1. **Bidirectional OS Peer Identity Verification**:
    - Both peers verify each other's full process-instance identity via kernel queries:
      * Server queries Client: `GetNamedPipeClientProcessId(hPipe, &client_pid)`, client binary image path via `QueryFullProcessImageNameW`, creation timestamp via `GetProcessTimes(&client_creation_filetime_ticks)`, and client token Logon SID via `OpenProcessToken` + `GetTokenInformation`.
@@ -389,34 +413,46 @@ For Subphase 2C.5, Presence defines an authenticated local IPC channel to receiv
    - Explicit user-mediated command generates a 256-bit pairing secret ($K_{\text{pair}}$).
    - Stored in VS Code `SecretStorage` (DPAPI) and Presence credential vault (DPAPI).
    - **Never** exposed via command-line flags, environment variables, shell history, persistent logs, or unencrypted temp files.
-3. **Canonical Binary Transcript Serialization ($T$) (P2C-30)**:
-   The handshake transcript $T$ is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian):
+3. **Canonical Binary Transcript Serialization ($T$) & Strict Field Validation (P2C-30, P2C-34)**:
+   The handshake transcript $T$ is deterministically serialized into an unambiguous binary byte sequence using network byte order (big-endian). All fields are validated with explicit exceptions (never bare assertions):
+   - Protocol version: `1 <= version <= 0xFFFFFFFF`
+   - Endpoint: Valid pipe syntax matching `^\\\\\.\\pipe\\[A-Za-z0-9._-]+$`, length `<= 0xFFFF`
+   - PIDs: `0 <= pid <= 0xFFFFFFFF`
+   - Creation ticks: `0 <= ticks <= 0xFFFFFFFFFFFFFFFF`
+   - Logon SIDs: Valid string format matching `^S-1-5-5-\d+-\d+$`, length `<= 0xFFFF`
+   - Nonces: Exactly 32 bytes each
+   - Negotiated parameter: `max_payload_bytes` (uint32_be = 65536)
    ```
    [4 bytes] protocol_version (uint32_be = 0x00000001)
-   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8, max 256)
+   [2 bytes] endpoint_len + [endpoint_len bytes] canonical_pipe_endpoint (UTF-8)
    [4 bytes] server_pid (uint32_be)
    [8 bytes] server_creation_filetime_ticks (uint64_be)
-   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII, max 128)
+   [2 bytes] server_logon_sid_len + [server_logon_sid_len bytes] server_logon_sid (ASCII)
    [4 bytes] client_pid (uint32_be)
    [8 bytes] client_creation_filetime_ticks (uint64_be)
-   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII, max 128)
+   [2 bytes] client_logon_sid_len + [client_logon_sid_len bytes] client_logon_sid (ASCII)
    [32 bytes] server_nonce (raw random bytes)
    [32 bytes] client_nonce (raw random bytes)
+   [4 bytes] max_payload_bytes (uint32_be = 65536)
    ```
-4. **Standard HKDF-SHA256 Key Derivation & Challenge-Response (RFC 5869)**:
+4. **Standard RFC 5869 HKDF-SHA256 Key Derivation & HMAC Proof Authentication (P2C-34)**:
    - Server sends `AUTH_CHALLENGE`: 32-byte `server_nonce`.
    - Client generates 32-byte `client_nonce`.
    - Both endpoints derive Pseudorandom Key ($\text{PRK}$) via HKDF-Extract:
-     $$\text{PRK} = \text{HMAC-SHA256}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
-   - Client sends `AUTH_RESPONSE` with `client_proof`:
-     $$\text{client\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"} \parallel T, 32)$$
-   - Server independently computes expected `client_proof` and verifies using constant-time `secrets.compare_digest`.
+     $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM}=K_{\text{pair}})$$
+   - Both endpoints derive separate, purpose-specific keys via HKDF-Expand:
+     $$\begin{aligned}
+     K_{\text{client\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_CLIENT_AUTH_V1"}, 32) \\
+     K_{\text{server\_auth}} &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"}, 32) \\
+     K_{\text{session}}     &= \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"}, 32)
+     \end{aligned}$$
+   - Client calculates authentication proof and sends `AUTH_RESPONSE`:
+     $$\text{client\_proof} = \text{HMAC-SHA256}(K_{\text{client\_auth}}, T)$$
+   - Server independently calculates expected `client_proof` and verifies using constant-time `secrets.compare_digest`.
    - Server returns `AUTH_CONFIRM` with `server_proof`:
-     $$\text{server\_proof} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SERVER_AUTH_V1"} \parallel T, 32)$$
+     $$\text{server\_proof} = \text{HMAC-SHA256}(K_{\text{server\_auth}}, T)$$
    - Client independently verifies `server_proof` using `secrets.compare_digest`.
-   - Both endpoints derive the ephemeral session key ($K_{\text{session}}$):
-     $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{"PRESENCE_VSCODE_SESSION_KEY_V1"} \parallel T, 32)$$
-   - Nonces expire after 10 seconds; single-use cache prevents replay attacks.
+   - Ephemeral symmetric key $K_{\text{session}}$ is established for the session. Nonces expire after 10 seconds; single-use cache prevents replay attacks.
 
 ### 7.3 Message Framing & Canonical Operation Allowlist (P2C-27)
 - **Framing**: Byte stream with 4-byte big-endian unsigned integer length prefix (`>I`), max frame 64 KB (`65536` bytes). Payloads exceeding 64 KB cause immediate connection termination.

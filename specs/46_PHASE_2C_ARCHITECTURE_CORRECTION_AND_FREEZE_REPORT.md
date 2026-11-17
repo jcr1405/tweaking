@@ -74,6 +74,9 @@ The audit examined five existing architecture documents and three primary implem
 | **P2C-29** | High | Concurrency/Dispatch | WinEvent hook callback used blocking lock acquisition `with _queue_lock:`, risking message-pump stalls under consumer contention. |
 | **P2C-30** | Critical | Security/Crypto | HMAC transcript lacked deterministic canonical binary wire serialization, omitted server creation ticks and Logon SID, and used ad-hoc HMAC instead of RFC 5869 HKDF-SHA256. |
 | **P2C-31** | Medium | Methodology/Evidentiary | Acceptance gate table labeled all gates simply `PASS`, failing to distinguish between verified design/documentation, implementation-verified tests, and un-implemented Phase 2C code. |
+| **P2C-32** | Critical | Security/IPC | Named pipe DACL compatibility with actual Node.js/libuv client (`net.connect` -> `CreateFileW(GENERIC_READ | GENERIC_WRITE)`) while strictly withholding `FILE_CREATE_PIPE_INSTANCE` (0x0004). Verified experimentally with Node.js v24.15.0 / libuv v1.51.0. |
+| **P2C-33** | High | Concurrency/Dispatch | Unsynchronized fallback slot introduced lost-wakeup race; unbounded `create_task` per event caused task accumulation. Resolved via SPSC ring buffer and supervised single consumer worker (`active_foreground_consumer_count <= 1`). |
+| **P2C-34** | Critical | Security/Crypto | HKDF-Expand key derivation output ambiguously described as HMAC authentication proof; lack of explicit field validation. Resolved via RFC 5869 purpose-specific keys, separate HMAC proofs, and strict type/range/regex validation. |
 
 ---
 
@@ -440,16 +443,54 @@ The audit examined five existing architecture documents and three primary implem
 
 ---
 
+### 5.32 Finding P2C-32: Named-Pipe ACL Versus Node.js/libuv Client Interoperability
+- **Original Question**: Does the hardened named-pipe DACL `D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)` with client mask `0x0012019B` (which withholds `FILE_CREATE_PIPE_INSTANCE` `0x0004`) allow the real Node.js / libuv client to obtain a full-duplex handle via `CreateFileW(GENERIC_READ | GENERIC_WRITE)`?
+- **Empirical Verification**: Built an isolated native experiment with the installed Node.js v24.15.0 and libuv v1.51.0 on Windows 11 Build 26200. Proved that `net.connect()` succeeds, full duplex communication functions reliably, overlapped I/O completes, and rogue attempts by client or other processes to create a second pipe instance fail with `ERROR_ACCESS_DENIED` (`5`).
+- **Classification**: **VERIFIED EXPERIMENTALLY**.
+
+---
+
+### 5.33 Finding P2C-33: Race-Free WinEvent SPSC Buffer & Supervised Consumer
+- **Original Flaw**: The unsynchronized fallback slot in try-lock dispatch introduced a lost-wakeup race where events written during consumer drain could remain stranded. Furthermore, creating a detached task per event (`create_task`) allowed unbounded task accumulation.
+- **Corrective Decision**:
+  1. Implemented a lock-free Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64) between the WinEvent callback and the asyncio consumer.
+  2. Implemented a single supervised consumer worker task with invariant `active_foreground_consumer_count <= 1`.
+  3. Single-pending wake-up coalescing (`pending_notification_count <= 1`) guarantees zero lost wakeups and strictly bounds task backlog.
+- **Classification**: **CORRECTED**.
+
+---
+
+### 5.34 Finding P2C-34: HKDF Purpose-Specific Keys & Separate HMAC Proofs
+- **Original Flaw**: HKDF-Expand key derivation output was ambiguously conflated with completed HMAC authentication proofs, and transcript packing lacked explicit input validation before serialization.
+- **Corrective Decision**:
+  1. Followed standard RFC 5869 HKDF-SHA256 to derive distinct purpose-specific keys: `K_client_auth`, `K_server_auth`, and `K_session`.
+  2. Separately computed authentication proofs: `client_proof = HMAC-SHA256(K_client_auth, T)` and `server_proof = HMAC-SHA256(K_server_auth, T)`.
+  3. Enforced strict validation of all transcript fields using explicit `ValueError` / `TypeError` exceptions prior to binary struct packing.
+- **Classification**: **CORRECTED**.
+
+---
+
 ## 6. Cross-Specification Consistency Matrix
 
-All nine architecture specifications were audited together to ensure total cross-document alignment:
+All ten architecture specifications were audited together to ensure total cross-document alignment:
 
-| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Alignment Verdict |
-|---|---|---|---|---|---|---|---|---|---|:---:|
-| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | Sec 8 | **CONSISTENT** |
-| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | Sec 8 | **CONSISTENT** |
-| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
-| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | Sec 8 | **CONSISTENT** |
+| Architecture Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Alignment Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **Context Source Ownership** | Manager owns sources | Sources report to manager | Isolated from tools | Phased source creation | ADR-2C-01/02 | Sec 5 | Sec 21 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
+| **Context Snapshot Model** | Deeply immutable | Transient single snapshot | Snapshot ID verified | Subphase 2C.0/2 | ADR-2C-03 | Sec 5.2 | Sec 8 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
+| **Sensitivity Classification** | Item-level (`ContextItem`)| 4-tier model | Enforced on output | Item filtering in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
+| **Retention & TTL Policy** | Replaced on focus switch| Transient memory only | N/A (transient tools) | Verified in 2C.0 | ADR-2C-03 | Sec 5.2 | Sec 28 | Sec 8 | Sec 8 | Sec 7 | **CONSISTENT** |
+| **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
+| **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | Sec 7 | **CONSISTENT** |
+| **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership**| N/A | Zone checks preserved | Flags; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 5.17 | Sec 3-4 | Sec 4 | Sec 4 | Sec 7 | **CONSISTENT** |
+| **FILETIME Integer Arithmetic**| Canonical ticks; int timedelta| WindowIdentity ticks | Raw integer equality | Subphase 2C.0/1 | ADR-2C-11 | Sec 5.18/23 | Sec 5-8 | Sec 7 | Sec 7 | Sec 7 | **CONSISTENT** |
+| **Named Pipe DACL & Owner Rights**| D:P(A;;RC;;;OW)(A;;0x12019b;;;<LogonSID>)| RC to OW; Logon SID only | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/21/28/32 | Sec 9-11 | Sec 5 | Sec 4-5 | Sec 3-6 | **CONSISTENT** |
+| **CreateNamedPipeW Parameters**| dwOpenMode vs dwPipeMode| dwOpenMode vs dwPipeMode | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9-11 | Sec 6 | Sec 6 | Sec 3 | **CONSISTENT** |
+| **Race-Free WinEvent SPSC & Worker**| SPSC buffer; single worker | Threat T-01 bounded | N/A | Subphase 2C.1; Exp G| ADR-2C-13 | Sec 5.20/24/29/33 | Sec 21-24 | Sec 8 | Sec 7 | Sec 7-9 | **CONSISTENT** |
+| **Owner Hook Teardown**| Thread calls UnhookWinEvent| Threat T-01 | N/A | Timeout failure state| ADR-2C-13 | Sec 5.20/25 | Sec 21-27 | Sec 9 | Sec 8 | Sec 7 | **CONSISTENT** |
+| **Binary Transcript HKDF/HMAC**| Canonical binary T; separate keys + proofs | Bidirectional peer identity; HKDF | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.19/26/30/34 | Sec 13-16 | Sec 10 | Sec 9-11 | Sec 10-12 | **CONSISTENT** |
+| **Canonical VS Code Allowlist**| vscode.* (no shutdown) | vscode.* (no shutdown) | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 12 | Sec 7 | **CONSISTENT** |
 | **Model-Provider Egress** | Sanitized metadata only | Explicit egress rules | N/A | Implemented in 2C.2 | ADR-2C-06 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
 | **MCP Data Sharing** | Stripped from tool calls | Isolated; zero leakage | Clean params | Tested in 2C.2 | ADR-2C-04 | Sec 5.3 | Sec 19 | Sec 11 | Sec 11 | **CONSISTENT** |
 | **Permission Levels** | `AuthorityLevel.L0_OBSERVE`| Boundary enforcement | Exact enum names | Verified in 2C.3/4 | ADR-2C-04 | Sec 5.15 | Sec 19 | Sec 12 | Sec 12 | **CONSISTENT** |

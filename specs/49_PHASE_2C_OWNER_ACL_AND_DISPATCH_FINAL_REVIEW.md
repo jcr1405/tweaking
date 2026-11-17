@@ -234,11 +234,14 @@ Presence decouples the hook thread from the asyncio consumer thread using a non-
 ```
 
 ### 7.4 Invariant Guarantees
-1. **Message Pump Non-Blocking Invariant**: `hook_proc` contains zero blocking operations, zero I/O, zero window caption calls, and acquires `_queue_lock` strictly with `blocking=False`.
+1. **Message Pump Non-Blocking Invariant**: `hook_proc` contains zero blocking operations, zero I/O, zero window caption calls, and operates strictly non-blocking.
 2. **Single-Pending-Notification Invariant**:
    $$\text{pending\_notification\_count} \le 1 \quad \forall t$$
-   At most one `_notify_event_available` task is scheduled on the asyncio event loop queue at any time.
-3. **Zero Lost Wakeups**: If an event arrives during consumer drain, either it enters the fallback slot or the queue, and since the consumer holds the lock, it drains the fallback slot before releasing the lock or a subsequent notification is scheduled.
+   At most one notification is scheduled on the asyncio event loop queue at any time.
+3. **SPSC Ring Buffer & Supervised Worker Invariant (P2C-33)**:
+   As formalized in Specification 50 (P2C-33), the fallback slot is replaced by a lock-free Single-Producer Single-Consumer (SPSC) ring buffer (capacity 64) paired with a supervised consumer worker task satisfying:
+   $$\text{active\_foreground\_consumer\_count} \le 1 \quad \forall t$$
+   This eliminates the lost-wakeup hazard during consumer drain and eliminates unbounded detached task accumulation (`asyncio.create_task` accumulation).
 
 ---
 
@@ -320,6 +323,7 @@ T = \ &[\text{uint32\_be: version}] \\
 
 ### 9.2 Authoritative Python Serialization Implementation
 ```python
+import re
 import struct
 
 def serialize_handshake_transcript(
@@ -334,16 +338,31 @@ def serialize_handshake_transcript(
     server_nonce: bytes,
     client_nonce: bytes,
 ) -> bytes:
-    assert len(server_nonce) == 32, "server_nonce must be exactly 32 bytes"
-    assert len(client_nonce) == 32, "client_nonce must be exactly 32 bytes"
+    # P2C-34: Strict field validation with explicit exceptions (no bare asserts)
+    if not isinstance(version, int) or version <= 0:
+        raise ValueError(f"Invalid version: {version}")
+    if not isinstance(endpoint, str) or not re.match(r"^\\\\\.\\pipe\\[A-Za-z0-9._-]+$", endpoint):
+        raise ValueError(f"Invalid named pipe endpoint: {endpoint}")
+    if not (0 <= server_pid <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid server_pid: {server_pid}")
+    if not (0 <= server_creation_ticks <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError(f"Invalid server_creation_ticks: {server_creation_ticks}")
+    if not isinstance(server_logon_sid, str) or not re.match(r"^S-1-5-5-\d+-\d+$", server_logon_sid):
+        raise ValueError(f"Invalid server_logon_sid: {server_logon_sid}")
+    if not (0 <= client_pid <= 0xFFFFFFFF):
+        raise ValueError(f"Invalid client_pid: {client_pid}")
+    if not (0 <= client_creation_ticks <= 0xFFFFFFFFFFFFFFFF):
+        raise ValueError(f"Invalid client_creation_ticks: {client_creation_ticks}")
+    if not isinstance(client_logon_sid, str) or not re.match(r"^S-1-5-5-\d+-\d+$", client_logon_sid):
+        raise ValueError(f"Invalid client_logon_sid: {client_logon_sid}")
+    if not isinstance(server_nonce, (bytes, bytearray)) or len(server_nonce) != 32:
+        raise ValueError("server_nonce must be exactly 32 bytes")
+    if not isinstance(client_nonce, (bytes, bytearray)) or len(client_nonce) != 32:
+        raise ValueError("client_nonce must be exactly 32 bytes")
     
     ep_bytes = endpoint.encode("utf-8")
     s_sid_bytes = server_logon_sid.encode("utf-8")
     c_sid_bytes = client_logon_sid.encode("utf-8")
-    
-    assert len(ep_bytes) <= 65535, "endpoint string exceeds uint16 length"
-    assert len(s_sid_bytes) <= 65535, "server logon SID exceeds uint16 length"
-    assert len(c_sid_bytes) <= 65535, "client logon SID exceeds uint16 length"
     
     fmt = f">I H{len(ep_bytes)}s I Q H{len(s_sid_bytes)}s I Q H{len(c_sid_bytes)}s 32s 32s"
     return struct.pack(
@@ -356,8 +375,8 @@ def serialize_handshake_transcript(
         client_pid,
         client_creation_ticks,
         len(c_sid_bytes), c_sid_bytes,
-        server_nonce,
-        client_nonce,
+        bytes(server_nonce),
+        bytes(client_nonce),
     )
 ```
 
@@ -416,17 +435,17 @@ Both parties combine the exchanged 32-byte nonces as the HKDF salt, and use the 
 
 $$\text{PRK} = \text{HKDF-Extract}(\text{salt} = \text{server\_nonce} \parallel \text{client\_nonce}, \text{IKM} = K_{\text{pair}})$$
 
-### 11.2 HKDF-Expand & Domain Separation
-Using Pseudorandom Key $\text{PRK}$, endpoints derive domain-separated digests and keys:
+### 11.2 HKDF-Expand & Purpose-Specific Key Derivation (P2C-34)
+Using Pseudorandom Key $\text{PRK}$, endpoints derive purpose-specific symmetric keys via standard RFC 5869 HKDF-Expand:
 
-1. **Client Authentication Digest**:
-   $$\text{client\_digest} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_CLIENT\_AUTH\_V1"} \parallel T, L = 32)$$
-2. **Server Authentication Digest**:
-   $$\text{server\_digest} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_SERVER\_AUTH\_V1"} \parallel T, L = 32)$$
+1. **Client Authentication Key**:
+   $$K_{\text{client\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_CLIENT\_AUTH\_V1"}, L = 32)$$
+2. **Server Authentication Key**:
+   $$K_{\text{server\_auth}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_SERVER\_AUTH\_V1"}, L = 32)$$
 3. **Ephemeral Symmetric Session Key**:
-   $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_SESSION\_KEY\_V1"} \parallel T, L = 32)$$
+   $$K_{\text{session}} = \text{HKDF-Expand}(\text{PRK}, \text{info} = \text{b"PRESENCE\_VSCODE\_SESSION\_KEY\_V1"}, L = 32)$$
 
-### 11.3 Mutual Authentication Exchange Flow
+### 11.3 Mutual Authentication Exchange Flow & HMAC Proofs (P2C-34)
 ```
 Presence Server                                            VS Code Extension
       │                                                           │
@@ -436,16 +455,18 @@ Presence Server                                            VS Code Extension
       │  2. AUTH_CHALLENGE (server_nonce: 32 bytes)               │
       │──────────────────────────────────────────────────────────►│
       │                                                           │
-      │  3. AUTH_RESPONSE (client_nonce, client_digest)           │
+      │  3. Derives keys via HKDF-Expand;                         │
+      │     client_proof = HMAC-SHA256(K_client_auth, T)          │
+      │     AUTH_RESPONSE (client_nonce, client_proof)            │
       │◄──────────────────────────────────────────────────────────│
       │                                                           │
-      │  4. Verify client_digest via secrets.compare_digest()     │
-      │     Compute server_digest                                 │
-      │     AUTH_CONFIRM (server_digest)                          │
+      │  4. Verify client_proof via secrets.compare_digest()      │
+      │     server_proof = HMAC-SHA256(K_server_auth, T)          │
+      │     AUTH_CONFIRM (server_proof)                           │
       │──────────────────────────────────────────────────────────►│
       │                                                           │
-      │  5. Verify server_digest via secrets.compare_digest()     │
-      │     Session established; derive K_session                 │
+      │  5. Verify server_proof via secrets.compare_digest()      │
+      │     Session established; adopt K_session                  │
 ```
 
 ---
@@ -502,24 +523,24 @@ The live codebase test suites were executed to verify that Phase 2B.1 security, 
 
 ---
 
-## 14. Cross-Document Consistency Matrix (Specs 41–49)
+## 14. Cross-Document Consistency Matrix (Specs 41–50)
 
-| Architectural Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Status |
-|---|---|---|---|---|---|---|---|---|---|:---:|
-| **Named Pipe DACL SDDL** | `D:P(A;;RC;;;OW)...` | `(A;;RC;;;OW)` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10 | Sec 5 | Sec 4 | **CONSISTENT** |
-| **Owner Rights Restriction** | Restricted to `RC` | `OW` restricted | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10.3 | Sec 5.2 | Sec 4.4 | **CONSISTENT** |
-| **Client Access Mask** | `0x0012019B` | `0x0012019B` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21 | Sec 10.4 | Sec 5.3 | Sec 6 | **CONSISTENT** |
-| **Pipe Flags & Parameter Separation** | `0x40080003` / `0x0008` | Fail-closed | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 5 | **CONSISTENT** |
-| **WinEvent Try-Lock & Fallback** | Non-blocking try-lock | Non-blocking | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.29 | Sec 22.2 | Sec 8.2 | Sec 7 | **CONSISTENT** |
-| **Single-Pending Coalescing** | `pending <= 1` | Bounded queue | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.24 | Sec 23.1 | Sec 8.2 | Sec 7.4 | **CONSISTENT** |
-| **Hook Teardown Lifecycle** | Owner unhook | Timeout error | N/A | Exp F join | ADR-2C-13 | Sec 5.25 | Sec 21.2 | Sec 9 | Sec 8 (Scen 8) | **CONSISTENT** |
-| **Handshake Transcript Wire Format** | Canonical binary | Canonical binary | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 14.1 | Sec 10.1 | Sec 9 | **CONSISTENT** |
-| **Bidirectional Peer Identity** | Symmetrical queries | Symmetrical queries | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 12 | Sec 10.1 | Sec 10 | **CONSISTENT** |
-| **HKDF-SHA256 Key Derivation** | RFC 5869 Extract/Expand | RFC 5869 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 14.2 | Sec 10.3 | Sec 11 | **CONSISTENT** |
-| **Canonical FILETIME Ticks** | 64-bit integer ticks | Raw ticks | Integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 5-7 | Sec 7 | Sec 9 | **CONSISTENT** |
-| **ShellExecute Flags & Ownership** | N/A | Zone preserved | `0x0400`; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3-4 | Sec 3-4 | Sec 2 | **CONSISTENT** |
-| **Canonical VS Code Allowlist** | `vscode.*` namespace | Prohibit shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 3 | **CONSISTENT** |
-| **Evidence & Gate Classification** | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Sec 8 | Sec 31 | Sec 14-15 | Sec 12-13 | **CONSISTENT** |
+| Architectural Dimension | Spec 41 | Spec 42 | Spec 43 | Spec 44 | Spec 45 | Spec 46 | Spec 47 | Spec 48 | Spec 49 | Spec 50 | Status |
+|---|---|---|---|---|---|---|---|---|---|---|:---:|
+| **Named Pipe DACL SDDL** | `D:P(A;;RC;;;OW)...` | `(A;;RC;;;OW)` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10 | Sec 5 | Sec 4 | Sec 3-5 | **CONSISTENT** |
+| **Owner Rights Restriction** | Restricted to `RC` | `OW` restricted | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.28 | Sec 10.3 | Sec 5.2 | Sec 4.4 | Sec 5 | **CONSISTENT** |
+| **Client Access Mask & libuv** | `0x0012019B` | `0x0012019B` | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.21, 5.32 | Sec 10.4 | Sec 5.3 | Sec 6 | Sec 3-6 | **CONSISTENT** |
+| **Pipe Flags & Parameter Separation** | `0x40080003` / `0x0008` | Fail-closed | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.22 | Sec 9 | Sec 6 | Sec 5 | Sec 3 | **CONSISTENT** |
+| **Race-Free WinEvent SPSC Buffer** | SPSC maxlen 64 | Non-blocking | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.29, 5.33 | Sec 22.2 | Sec 8.2 | Sec 7 | Sec 7-8 | **CONSISTENT** |
+| **Supervised Consumer & Coalescing** | `active <= 1`, `pending <= 1` | Bounded queue | N/A | Subphase 2C.1 | ADR-2C-13 | Sec 5.24, 5.33 | Sec 23.1 | Sec 8.2 | Sec 7.4 | Sec 9 | **CONSISTENT** |
+| **Hook Teardown Lifecycle** | Owner unhook | Timeout error | N/A | Exp F join | ADR-2C-13 | Sec 5.25 | Sec 21.2 | Sec 9 | Sec 8 (Scen 8) | Sec 7 | **CONSISTENT** |
+| **Handshake Transcript Wire Format** | Canonical binary | Canonical binary | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34 | Sec 14.1 | Sec 10.1 | Sec 9 | Sec 11 | **CONSISTENT** |
+| **Bidirectional Peer Identity** | Symmetrical queries | Symmetrical queries | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30 | Sec 12 | Sec 10.1 | Sec 10 | Sec 10 | **CONSISTENT** |
+| **HKDF-SHA256 Keys & HMAC Proofs** | RFC 5869 keys + HMAC proofs | RFC 5869 | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.30, 5.34 | Sec 14.2 | Sec 10.3 | Sec 11 | Sec 10 | **CONSISTENT** |
+| **Canonical FILETIME Ticks** | 64-bit integer ticks | Raw ticks | Integer equality | Subphase 2C.0 | ADR-2C-11 | Sec 5.23 | Sec 5-7 | Sec 7 | Sec 9 | Sec 7 | **CONSISTENT** |
+| **ShellExecute Flags & Ownership** | N/A | Zone preserved | `0x0400`; CloseHandle | Subphase 2C.4 | ADR-2C-10 | Sec 3.1 | Sec 3-4 | Sec 3-4 | Sec 2 | Sec 7 | **CONSISTENT** |
+| **Canonical VS Code Allowlist** | `vscode.*` namespace | Prohibit shutdown | N/A | Subphase 2C.5 | ADR-2C-12 | Sec 5.27 | Sec 19 | Sec 12 | Sec 3 | Sec 7 | **CONSISTENT** |
+| **Evidence & Gate Classification** | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Distinct statuses | Sec 8 | Sec 31 | Sec 14-15 | Sec 12-13 | Sec 16 | **CONSISTENT** |
 
 ---
 

@@ -38,6 +38,7 @@ class PresenceRuntime:
         mutex_name: str = "Local\\PresenceRuntime_SingleInstanceMutex",
         db_path: Optional[str] = None,
         log_dir: Optional[str] = None,
+        enable_context_awareness: bool = False,
     ):
         self.instance_id: str = str(uuid.uuid4())
         self.pid: int = os.getpid()
@@ -57,6 +58,20 @@ class PresenceRuntime:
         self.permissions = PermissionBoundary()
         self.persistence = PersistenceManager(db_path=db_path)
         self.commands = CommandDispatcher(permissions=self.permissions, runtime_ref=self)
+
+        # 4. Context Awareness (Phase 2C)
+        self.enable_context_awareness = enable_context_awareness
+        self.context_manager: Optional[Any] = None
+        self.foreground_source: Optional[Any] = None
+        if self.enable_context_awareness:
+            from .context.manager import ContextManager
+            from .context.sources.foreground_window import Win32ForegroundWindowSource
+            self.context_manager = ContextManager(event_bus=self.events)
+            self.foreground_source = Win32ForegroundWindowSource(
+                event_bus=self.events,
+                on_snapshot_created=self.context_manager.set_current_snapshot,
+            )
+            self.context_manager.register_source(self.foreground_source)
 
         self._unclean_shutdowns_detected: List[Dict[str, Any]] = []
 
@@ -129,6 +144,15 @@ class PresenceRuntime:
         # 1. Signal background loops
         self._shutdown_event.set()
 
+        # Stop foreground context source if running
+        if self.foreground_source is not None:
+            try:
+                from .context.contracts import ContextSourceState
+                if self.foreground_source.state == ContextSourceState.RUNNING:
+                    self.foreground_source.stop_sync(timeout=2.0)
+            except Exception as e:
+                logger.error(f"Error stopping foreground source during runtime shutdown: {e}")
+
         # 2. Publish Stopping Event
         try:
             self.events.publish("RuntimeStopped", {
@@ -164,7 +188,7 @@ class PresenceRuntime:
         """Returns structured health and performance metrics."""
         uptime = time.time() - self.start_time if self.start_time else 0.0
         mem_info = get_process_memory_info(self.pid)
-        return {
+        status = {
             "instance_id": self.instance_id,
             "state": self.state.name,
             "pid": self.pid,
@@ -180,6 +204,14 @@ class PresenceRuntime:
                 "peak_working_set_bytes": mem_info.peak_working_set_bytes,
             },
         }
+        if self.context_manager is not None:
+            snap = self.context_manager.get_current_snapshot()
+            status["context_awareness"] = {
+                "enabled": True,
+                "has_snapshot": snap is not None,
+                "snapshot_id": snap.snapshot_id if snap else None,
+            }
+        return status
 
     def wait_for_shutdown(self, timeout: Optional[float] = None) -> bool:
         """Blocks until the runtime shutdown event is triggered."""

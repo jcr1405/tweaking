@@ -115,6 +115,11 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         default="Local\\PresenceRuntime_SingleInstanceMutex",
         help="Named Win32 mutex for instance isolation",
     )
+    parser.add_argument(
+        "--context-awareness",
+        action="store_true",
+        help="Enable native Windows foreground window awareness (Phase 2C.1)",
+    )
 
     parsed_args = parser.parse_args(args)
 
@@ -210,7 +215,10 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         return 0
 
     # Start runtime lifecycle for database / command operations
-    runtime = PresenceRuntime(mutex_name=parsed_args.mutex_name)
+    runtime = PresenceRuntime(
+        mutex_name=parsed_args.mutex_name,
+        enable_context_awareness=parsed_args.context_awareness,
+    )
     started = runtime.start()
 
     if not started:

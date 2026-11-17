@@ -25,6 +25,7 @@ from .models import (
     filetime_to_ticks,
 )
 from .source import ContextSource
+from .sources.foreground_window import BoundedEventQueue, Win32ForegroundWindowSource
 
 __all__ = [
     "ContextError",
@@ -48,4 +49,6 @@ __all__ = [
     "ContextSource",
     "ContextManager",
     "MockContextSource",
+    "BoundedEventQueue",
+    "Win32ForegroundWindowSource",
 ]

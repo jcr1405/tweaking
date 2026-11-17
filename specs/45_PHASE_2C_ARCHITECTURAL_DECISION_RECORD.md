@@ -241,28 +241,36 @@ In accordance with Presence engineering principles, mature open-source projects,
 - **Decision**:
   1. Implement dedicated `WinEventHookThread` hosting `GetMessageW` message pump. Idle CPU achieves kernel wait (< 0.05% design target, < 0.20% ceiling).
   2. Implement reentrancy guard (`_in_callback` flag) and bounded Python queue (`collections.deque(maxlen=64)` protected by an internal monitor). Usable capacity is exactly **64 entries**, operated via non-blocking try-lock (`acquire(blocking=False)`). Completely eliminates secondary blocking locks (`_state_lock` eliminated).
-  3. **Strict Ownership, Contention & Monitor Ownership Model (P2C-35, P2C-39, P2C-41, P2C-42, P2C-51)**:
-     - Producer appends to queue and owns drop accounting (`events_dropped_capacity` and `events_dropped_contention`). Producer never modifies consumer read state.
-     - Consumer drains batches ($O(n)$ bounded by $O(\text{capacity} = 64)$, memory verified at $11,128 \ \text{bytes} \approx 10.87 \ \text{KB}$) and owns processing telemetry. Consumer never modifies producer write state.
+  3. **Strict Ownership, Contention & Monitor Ownership Model (P2C-35, P2C-39, P2C-41, P2C-42, P2C-51, P2C-57)**:
+     - Producer appends to queue and owns drop accounting (`events_dropped_capacity`, `events_dropped_contention`, and `events_dropped_faulted`). Producer never modifies consumer read state.
+     - Consumer drains batches ($O(n)$ bounded by $O(\text{capacity} = 64)$, core container memory verified at $11,128 \ \text{bytes} \approx 10.87 \ \text{KB}$ nominal and $11,640 \ \text{bytes} \approx 11.37 \ \text{KB}$ upper-range) and owns processing telemetry. Consumer never modifies producer write state.
      - Monitor ownership rules (P2C-51): Lock acquisition strictly restricted to `push()` and `drain_and_reset()`. External diagnostic readers read attributes directly without locking, eliminating reader-induced contention drops.
      - Contention policy: if consumer holds lock during batch drain, producer try-lock immediately returns False without blocking the Win32 message pump, incrementing `events_dropped_contention`.
+     - Faulted policy (P2C-57): when `_faulted == True`, producer immediately rejects incoming events, incrementing `events_dropped_faulted`.
      - Capacity policy: when queue reaches 64 items, newest incoming event is dropped, incrementing `events_dropped_capacity`.
-     - Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False` and batch-drains the deque.
-  4. **CPython 3.12.7 AsyncIO Internals & Scheduling Atomicity (P2C-37, P2C-39, P2C-44, P2C-48, P2C-49)**:
-     - CPython 3.12.7 source audit: `call_soon_threadsafe()` appends to `_ready` directly and calls non-blocking `_write_to_self()` (loopback socket send) without internal locks. Thread-safe scheduling without hard real-time bounds.
-     - Failure handling atomicity (P2C-49): If scheduling fails, queue transitions to `_faulted = True`, retaining `_notification_pending = True` to guarantee that `notification_pending == False` strictly implies `queue_depth == 0`.
+     - Zero stranded events: `drain_and_reset()` atomically resets `_notification_pending = False`, `_faulted = False`, and batch-drains the deque.
+  4. **CPython 3.12.7 Proactor AsyncIO Internals & Error Suppression (P2C-37, P2C-39, P2C-44, P2C-48, P2C-49, P2C-54, P2C-55, P2C-56, P2C-58)**:
+     - CPython 3.12.7 source audit: `call_soon_threadsafe()` appends to `_ready` directly under GIL. Self-pipe wake-up `_write_to_self()` in `BaseProactorEventLoop` (`proactor_events.py`) writes to `_csock.send(b'\0')`, guards against `None`, and swallows `OSError`. Thread-safe scheduling without hard real-time bounds.
+     - Proactor close race (P2C-56): Proved that `call_soon_threadsafe()` can return successfully after the self-pipe is closed, only for `super().close()` to wipe callbacks. Native hook termination is therefore a mandatory prerequisite before stopping/closing the loop.
+     - Failure handling atomicity & Zero Synchronous Logging (P2C-49, P2C-54): If scheduling fails, queue transitions to `_faulted = True` via pure in-memory GIL atomic assignments (zero logging on callback path), retaining `_notification_pending = True` to guarantee that `notification_pending == False` strictly implies `queue_depth == 0`.
+     - Fail-Closed Policy (P2C-58): Graceful recovery following unexpected event-loop death has not been demonstrated; system fails closed and defers diagnostic logging to safe supervisor thread.
      - Five execution layers distinguished: zero application-level blocking lock waits, $O(1)$ callback-body execution, CPython GIL acquisition (`sys.getswitchinterval()` is an ideal timeslice target, not an absolute real-time bound), OS thread scheduling, and Win32 message dispatch. All unverified numerical latency claims (`<50 μs`, `0.2–0.5 μs`) are formally withdrawn.
-  5. Implement **Wake-Up Coalescing, Composite Freshness & Supervised Worker (P2C-24, P2C-33, P2C-40, P2C-47, P2C-52)**:
+  5. Implement **Wake-Up Coalescing, Best-Effort Composite Freshness & Supervised Worker (P2C-24, P2C-33, P2C-40, P2C-47, P2C-52, P2C-60)**:
      - Single-pending notification flag synchronized by the unified monitor.
      - Supervised single consumer worker task maintains invariants:
        $$\text{active\_foreground\_consumer\_count} \le 1, \quad \text{pending\_notification\_count} \le 1, \quad \text{queue\_depth} \le 64 \quad \forall t$$
      - Mandatory authoritative live state refresh: On every wake, consumer queries `GetForegroundWindow()`.
-     - Composite WindowIdentity Freshness Contract (P2C-52): Consumer validates `hwnd`, `pid`, `creation_filetime_ticks`, and `window_class` between initial and final queries. Mid-inspection focus shifts and HWND recycling attacks are cleanly aborted (`stale_snapshots_aborted += 1`), preserving the single-current-snapshot model.
-  6. Implement **Strict Hook/Loop Teardown Ordering (P2C-25, P2C-50)**:
+     - Best-Effort Composite WindowIdentity Freshness Contract (P2C-52, P2C-60): Consumer validates `hwnd`, `pid`, `creation_filetime_ticks`, and `window_class` between initial and final queries. Mid-inspection focus shifts and cross-process HWND recycling attacks are cleanly aborted (`stale_snapshots_aborted += 1`), preserving the single-current-snapshot model. Transparently acknowledges same-process/same-class recycling edge case.
+  6. Implement **Strict Quiesced Teardown Ordering & Timeout Abort (P2C-25, P2C-50, P2C-59)**:
      - Hook unhooks (`UnhookWinEvent`) strictly on `WinEventHookThread` upon receiving `WM_QUIT`.
-     - Supervisor joins hook thread (`thread.join(timeout=1.0)`) and verifies termination BEFORE stopping consumer worker and BEFORE stopping/closing event loop. Prohibits stopping or closing event loop while native hook can still issue callbacks.
+     - Supervisor joins hook thread (`thread.join(timeout=1.0)`). If timeout occurs, supervisor ABORTS shutdown, leaving loop open to absorb late callbacks, and escalates to fail-stop termination.
+     - Consumer worker is signaled and quiesced (`await consumer_task`) BEFORE supervisor reconciles queue under single ownership and BEFORE stopping/closing event loop.
   7. Establish seven standardized verification experiments (A through G, including Experiment G Stalled Consumer Backpressure Stress Test).
 - **Alternatives Considered**:
+  - *Synchronous logging in callback failure handler*: Introduced application-level blocking on `logging._lock` and file I/O. Excised in favor of pure in-memory atomic updates.
+  - *Reconciling queue before consumer quiescence*: Caused concurrent drain/commit race between supervisor and worker. Resolved by awaiting consumer quiescence first.
+  - *Proceeding with loop shutdown after hook join timeout*: Exposed late callbacks to crashes on closed loop. Resolved by aborting shutdown and escalating.
+  - *Universal window lifetime guarantee*: Win32 User32 APIs lack window generation IDs and tracking all creates/destroys violates privacy boundaries. Reframed as Best-Effort Composite Window Identity.
   - *Resetting notification_pending=False on scheduling failure*: Left unread events stranded in queue without pending notification. Corrected via controlled fault state.
   - *Stopping event loop before hook unhooking*: Allowed late callbacks to hit stopped or closed loops. Corrected via strict shutdown ordering.
   - *Diagnostic readers acquiring queue lock*: Caused contention drops for producer without triggering consumer refresh. Corrected by restricting monitor access and using lock-free attribute reads.
@@ -303,10 +311,10 @@ In accordance with Presence engineering principles, mature open-source projects,
 | **ADR-2C-10** | Shell Flags | Correct `SEE_MASK_FLAG_NO_UI`, handle ownership & Class C | Fixed constant confusion; caller closes `hProcess`; async shell classification |
 | **ADR-2C-11** | Process Identity | Canonical FILETIME ticks & integer arithmetic | 64-bit unsigned ticks; integer timedelta conversion; zero float in identity path |
 | **ADR-2C-12** | Local IPC | Hardened named pipe DACL & HKDF/HMAC mutual auth | Owner restricted to `RC`; Logon SID only; withhold 0x0004 (isolated DACL test verified); fullmatch validation; session key reserved/deferred |
-| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Unified non-blocking monitor (capacity 64); zero secondary locks; no-reader-lock protocol; failure atomicity; composite WindowIdentity freshness check; strict shutdown ordering; single consumer worker (`<= 1`); owner unhooks |
+| **ADR-2C-13** | Hook Model | Bounded event queue & supervised worker | Unified non-blocking monitor (capacity 64); zero secondary locks; zero callback logging; faulted drop accounting; no-reader-lock protocol; failure atomicity; best-effort composite WindowIdentity; quiesced shutdown ordering & timeout abort; single consumer worker (`<= 1`); owner unhooks |
 
 ---
 
 ## 5. Architectural Consistency & Gate Readiness
 
-Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 54.
+Specifications 41 through 45 are now completely reconciled, internally consistent, and fully verified against Microsoft Learn documentation and actual Presence source code. The architecture is ready for final Architectural Acceptance Gate evaluation in Specifications 46 through 55.

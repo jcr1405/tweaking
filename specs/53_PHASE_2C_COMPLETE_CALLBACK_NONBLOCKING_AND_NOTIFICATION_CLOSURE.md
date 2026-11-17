@@ -244,7 +244,7 @@ class BoundedEventQueue:
 ### 5.1 Invocation Contract in Python 3.12
 `loop.call_soon_threadsafe(self.event_available.set)` is invoked by the `WinEventHookThread` only when `push()` transitions `_notification_pending` from `False` to `True`.
 
-In CPython 3.12 (`asyncio.base_events.py` and `asyncio.windows_events.py`):
+In CPython 3.12 (`asyncio.base_events.py` and `asyncio.proactor_events.py`):
 1. `call_soon_threadsafe` checks `self._check_closed()`. It does not acquire an internal asyncio lock; `self._ready.append(handle)` is serialized under the CPython GIL.
 2. It wraps the callback in an `asyncio.Handle` and appends it directly to `self._ready`.
 3. It calls `self._write_to_self()`: on Windows with `ProactorEventLoop`, this writes a single `b'\0'` byte to a non-blocking loopback `socketpair` (`csock.send()`), unblocking `GetQueuedCompletionStatus` in the loop thread.

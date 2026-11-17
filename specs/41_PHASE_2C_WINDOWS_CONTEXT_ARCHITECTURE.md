@@ -258,25 +258,24 @@ To establish a strictly bounded, reliable pipeline under CPython:
 5. **Single-Pending Notification & Event-Loop Signalling (P2C-40, P2C-43, P2C-48, P2C-49)**:
    - Invariants: `pending_notification_count <= 1`, `active_foreground_consumer_count <= 1`, and `queue_depth <= 64` at all times.
    - When an event is pushed: if `_notification_pending` is False, it is set to True, and `loop.call_soon_threadsafe(event_available.set)` is scheduled once. If True, `events_coalesced` is incremented without redundant scheduling.
-   - **CPython 3.12.7 AsyncIO Internals (P2C-48)**: In CPython 3.12.7 (`asyncio/base_events.py` and `asyncio/windows_events.py`), `call_soon_threadsafe` does not acquire an internal asyncio lock. It appends the handle to `self._ready` (thread-safe under GIL serialization) and calls `_write_to_self()` (a non-blocking loopback socket write to `self._csock.send(b'\0')` on Windows).
-   - **Failure Handling Atomicity (P2C-49)**: If `call_soon_threadsafe` fails (e.g., `RuntimeError` on closed loop), the system enters a controlled fault state (`_faulted = True`). Crucially, the system **NEVER resets `_notification_pending = False` while unread entries remain in the queue**, strictly preserving the invariant:
+   - **CPython 3.12.7 AsyncIO Internals & Error Suppression (P2C-48, P2C-55, P2C-56)**: In CPython 3.12.7, `call_soon_threadsafe` appends the handle to `self._ready` (thread-safe under GIL serialization). The self-pipe wake-up `_write_to_self()` is implemented in `BaseProactorEventLoop` (`Lib/asyncio/proactor_events.py`), which writes to `self._csock.send(b'\0')`. Crucially, `_write_to_self()` guards against `_csock is None` and swallows `OSError` without raising `RuntimeError`. If the loop begins closing concurrently, `call_soon_threadsafe()` can return successfully even after the self-pipe is closed. Therefore, native hook termination is a mandatory prerequisite before stopping or closing the loop.
+   - **Failure Handling Atomicity & Zero Synchronous Logging (P2C-49, P2C-54, P2C-57, P2C-58)**: If `call_soon_threadsafe` fails (e.g., `RuntimeError` on closed loop), the system enters a controlled fault state (`_faulted = True`). All synchronous logging is excised from the callback path to guarantee zero application-level blocking waits. Crucially, the system **NEVER resets `_notification_pending = False` while unread entries remain in the queue**, strictly preserving the invariant:
      $$\_notification\_pending == \text{False} \implies \text{queue\_depth} == 0$$
+     Incoming events during `_faulted` are rejected and counted under `events_dropped_faulted`.
 
-6. **Exact Memory Footprint & Complexity (P2C-46, P2C-53)**:
+6. **Memory Footprint across Integer Ranges & Complexity (P2C-46, P2C-53, P2C-61)**:
    - Push: $O(1)$ amortized and worst-case.
    - Drain: $O(n)$ strictly bounded by $O(\text{capacity} = 64)$ items.
-   - Peak heap memory of queue data structures in Python 3.12.7 AMD64 is verified at exactly:
-     $$64 \times 144 \text{ B (records)} + 1,288 \text{ B (deque)} + 568 \text{ B (batch)} + 56 \text{ B (lock)} = \mathbf{11,128 \text{ bytes}} \quad (10.87 \ \text{KB})$$
-     Including instance attribute dict (~152 bytes), total queue overhead is $\approx 11.4 \ \text{KB}$ ($< 12 \ \text{KB}$). This queue estimate is strictly distinguished from the total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
+   - Heap memory of core queue data structures in Python 3.12.7 AMD64:
+     * Nominal sample (integers $< 2^{30}$): $64 \times 144 \text{ B (records)} + 1,288 \text{ B (deque)} + 568 \text{ B (batch)} + 56 \text{ B (lock)} = \mathbf{11,128 \text{ bytes}}$ ($10.87 \ \text{KB}$).
+     * Upper-range sample (integers $\ge 2^{30}$): $64 \times 152 \text{ B (records)} + 1,288 \text{ B (deque)} + 568 \text{ B (batch)} + 56 \text{ B (lock)} = \mathbf{11,640 \text{ bytes}}$ ($11.37 \ \text{KB}$).
+     * Total queue object heap footprint (including instance `__dict__` and dynamic telemetry integers) is bounded below $\mathbf{< 16 \ \text{KB}}$, strictly distinguished from the total process working set ceiling ($< 8.0 \ \text{MB}$ above Phase 2B baseline).
 
-7. **Composite WindowIdentity Freshness Contract (P2C-47, P2C-52)**:
+7. **Best-Effort Composite WindowIdentity Freshness Contract (P2C-47, P2C-52, P2C-60)**:
    - The queue is a bounded trigger mechanism. On every wake, the consumer executes a mandatory authoritative live state refresh via User32 `GetForegroundWindow()`.
-   - To prevent committing stale metadata due to window focus changes or **HWND recycling attacks**, the consumer validates the complete composite `WindowIdentity`:
-     * `hwnd`
-     * `pid`
-     * `process_creation_filetime_ticks`
-     * `window_class`
+   - To prevent committing stale metadata due to window focus changes or cross-process HWND recycling, the consumer validates the composite `WindowIdentity`: `(hwnd, pid, creation_filetime_ticks, window_class)`.
    - If any of these fields change between pre-inspection and post-inspection, the snapshot is rejected as stale (`stale_snapshots_aborted += 1`), preserving the single-active-snapshot architecture.
+   - **Contractual Scope**: Defined as a best-effort composite window identity; it does not guarantee detection of rapid same-process, same-thread, same-class HWND reuse where all four fields remain identical under Win32 API boundaries.
 
 ```python
 @dataclass(frozen=True)
@@ -295,6 +294,7 @@ class BoundedEventQueue:
         self._faulted = False
         self.events_dropped_capacity = 0
         self.events_dropped_contention = 0
+        self.events_dropped_faulted = 0
         self.events_coalesced = 0
         self.raw_events_received = 0
         self.events_drained = 0
@@ -305,7 +305,11 @@ class BoundedEventQueue:
 
     @property
     def events_dropped(self) -> int:
-        return self.events_dropped_capacity + self.events_dropped_contention
+        return (
+            self.events_dropped_capacity +
+            self.events_dropped_contention +
+            self.events_dropped_faulted
+        )
 
     @property
     def notification_pending(self) -> bool:
@@ -319,7 +323,7 @@ class BoundedEventQueue:
         """
         self.raw_events_received += 1
         if self._faulted:
-            self.events_dropped_contention += 1
+            self.events_dropped_faulted += 1
             return False, False
             
         if not self._lock.acquire(blocking=False):
@@ -444,11 +448,17 @@ The teardown sequence is strictly owner-controlled:
 4. `WinEventHookThread`'s `GetMessageW` returns 0 on `WM_QUIT`.
 5. `WinEventHookThread` calls `UnhookWinEvent(self._hHook)` for its own hook, clears `self._hHook = None`, and exits its thread run method.
 6. The runtime thread waits for the hook thread via `thread.join(timeout=1.0)`.
-7. **Timeout Reality & Verification**:
-   - If `thread.is_alive()` is `False`: Clean termination is verified. Pending queue references are cleared.
-   - If `thread.is_alive()` is `True`: **DO NOT claim successful cleanup!** Report `HookShutdownTimeoutError` and log diagnostic evidence (thread TID, handle count).
-8. **Strict Hook/Event-Loop Lifecycle Ordering (P2C-50)**:
-   The supervisor strictly guarantees that `UnhookWinEvent` executes and `WinEventHookThread` terminates (`thread.join(timeout=1.0)`) BEFORE the consumer worker is stopped and BEFORE `loop.stop()` or `loop.close()` is invoked. The runtime prohibits stopping or closing the event loop while the native hook can still deliver callbacks.
+7. **Timeout Reality & Abort Protocol (P2C-25, P2C-59)**:
+   - If `thread.is_alive()` is `False`: Hook termination is verified. Producer is dead.
+   - If `thread.is_alive()` is `True`: **ABORT remaining shutdown sequence!** Do NOT proceed to event loop stop/close; keep loop alive to absorb late callbacks. Report `HookShutdownTimeoutError`, log diagnostic evidence (thread TID, handle count), and escalate to fail-stop process termination.
+8. **Strict Quiesced Teardown Sequence (P2C-50, P2C-59)**:
+   The supervisor strictly executes:
+   - (a) Hook thread joined and confirmed terminated.
+   - (b) Consumer worker signaled (`shutdown_event.set()`, unblock wait).
+   - (c) Supervisor awaits consumer quiescence (`await consumer_task`).
+   - (d) Single-owner queue reconciliation: supervisor drains remaining items (`queue.drain_and_reset()`).
+   - (e) Supervisor stops and closes event loop (`loop.stop()`, `loop.close()`).
+   This guarantees that the supervisor is the sole owner of the queue during final reconciliation and that no late callbacks can reach a stopped or closed loop.
 
 ---
 

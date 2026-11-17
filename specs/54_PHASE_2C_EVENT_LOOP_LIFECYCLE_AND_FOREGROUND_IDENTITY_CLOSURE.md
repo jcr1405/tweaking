@@ -16,7 +16,7 @@ Specification 54 establishes the final architectural closure and forensic valida
 Following the unification of the queue and notification monitor in Specification 53, a deep-dive audit of event-loop lifecycle boundaries, failure semantics, monitor ownership, and foreground identity validation identified six critical areas requiring correction:
 
 1. **P2C-48 (CPython 3.12.7 AsyncIO Internals Audit)**:
-   Audited CPython 3.12.7 (`Lib/asyncio/base_events.py` and `Lib/asyncio/windows_events.py`). Corrected the false assertion that `call_soon_threadsafe()` acquires an internal asyncio lock protecting `_ready`. Established the exact mechanism: handle creation, direct append to `_ready` under GIL serialization, and a non-blocking loopback socket write via `_write_to_self()` (`_csock.send(b'\0')`). Thread-safe scheduling is decoupled from wait-free or hard real-time claims.
+   Audited CPython 3.12.7 (`Lib/asyncio/base_events.py` and `Lib/asyncio/proactor_events.py`). Corrected the false assertion that `call_soon_threadsafe()` acquires an internal asyncio lock protecting `_ready`. Established the exact mechanism: handle creation, direct append to `_ready` under GIL serialization, and a non-blocking loopback socket write via `_write_to_self()` (`_csock.send(b'\0')`). Thread-safe scheduling is decoupled from wait-free or hard real-time claims.
 2. **P2C-49 (Notification Failure Atomicity & State Machine)**:
    Deconstructed and rejected the flawed pattern where `call_soon_threadsafe()` exceptions attempted a non-blocking try-lock reset of `_notification_pending = False`. Proved that resetting `_notification_pending` while unread events remain in the queue violates the fundamental invariant:
    $$\_notification\_pending == \text{False} \implies \text{queue\_depth} == 0$$
@@ -39,7 +39,7 @@ All 15 interleaving scenarios have been implemented in `specs/evidence/phase2c/q
 ### 2.1 Audit of CPython Source Code
 An audit of the supported runtime environment (CPython 3.12.7 AMD64) was conducted across the asyncio implementation files:
 - `Lib/asyncio/base_events.py` (`BaseEventLoop.call_soon_threadsafe`, `BaseEventLoop._call_soon`)
-- `Lib/asyncio/windows_events.py` (`ProactorEventLoop._write_to_self`)
+- `Lib/asyncio/proactor_events.py` (`BaseProactorEventLoop._write_to_self`, inherited by `windows_events.ProactorEventLoop`)
 
 ```python
 # CPython 3.12.7 - Lib/asyncio/base_events.py (lines 829-835)
@@ -59,14 +59,19 @@ def _call_soon(self, callback, args, context=None):
 ```
 
 ```python
-# CPython 3.12.7 - Lib/asyncio/windows_events.py (lines 438-444)
+# CPython 3.12.7 - Lib/asyncio/proactor_events.py (lines 785-802)
 def _write_to_self(self):
     csock = self._csock
-    if csock is not None:
-        try:
-            csock.send(b'\0')
-        except (BlockingIOError, InterruptedError):
-            pass
+    if csock is None:
+        return
+
+    try:
+        csock.send(b'\0')
+    except OSError:
+        if self._debug:
+            logger.debug("Fail to write a null byte into the "
+                         "self-pipe socket",
+                         exc_info=True)
 ```
 
 ### 2.2 Forensic Findings & Corrected Contract
@@ -149,13 +154,13 @@ The runtime establishes a formal state machine and failure protocol:
 
 ```python
 def handle_scheduling_failure(self) -> None:
-    """Atomic failure transition when event-loop scheduling fails."""
+    """
+    Atomic failure transition when event-loop scheduling fails.
+    CRITICAL (P2C-54): ZERO synchronous logging or I/O on callback path!
+    Invariant preserved: _notification_pending is NOT reset while queue has unread entries!
+    """
     self.scheduling_failures_total += 1
     self._faulted = True
-    # Invariant preserved: _notification_pending is NOT reset while queue has unread entries!
-    logger.critical(
-        "Event loop notification scheduling failed. Queue faulted; entering controlled teardown."
-    )
 ```
 
 ---
@@ -177,10 +182,11 @@ To prevent race conditions where callbacks fire into stopped or closed event loo
  5. WinEventHookThread Exits Message Pump
     │
  6. Supervisor Verifies Thread Termination (thread.join(timeout=1.0))
+    ├─► [IF TIMEOUT]: ABORT remaining shutdown steps! Keep loop open to absorb late callbacks.
+    ▼
+ 7. Consumer Worker Stopped & Joined (shutdown_event.set(), await consumer_task quiescence)
     │
- 7. Supervisor Drains & Reconciles Queue State (drain_and_reset())
-    │
- 8. Consumer Worker Stopped & Joined (shutdown_event.set(), cancel/join)
+ 8. Single-Owner Queue Reconciliation (supervisor exclusively executes drain_and_reset())
     │
  9. Event Loop Stopped (loop.stop())
     │
@@ -240,10 +246,19 @@ class BoundedEventQueue:
         self.events_pushed = 0
         self.events_dropped_capacity = 0
         self.events_dropped_contention = 0
+        self.events_dropped_faulted = 0
         self.events_coalesced = 0
         self.scheduling_failures_total = 0
         self.batches_drained = 0
         self.events_drained_total = 0
+
+    @property
+    def events_dropped(self) -> int:
+        return (
+            self.events_dropped_capacity +
+            self.events_dropped_contention +
+            self.events_dropped_faulted
+        )
 
     @property
     def notification_pending(self) -> bool:
@@ -340,8 +355,8 @@ class WindowIdentity:
    - The snapshot is discarded.
    - `self.stale_snapshots_aborted += 1` is incremented.
    - The consumer worker continues to the next cycle without updating the published snapshot.
-5. **Architectural Semantics**:
-   This check validates identity and foreground status at the final validation point. It does not claim that the window remained foreground continuously throughout inspection, but it mathematically guarantees that stale metadata is never committed to the active presence snapshot.
+5. **Architectural Semantics & Best-Effort Scope (P2C-60)**:
+   This check validates identity and foreground status at the final validation point. It guarantees protection against cross-process recycling, process restarts, and class shifts. It is classified as a **Best-Effort Composite Window Identity** because if the *same* process and *same* thread destroys a window and immediately creates a replacement of the *same* class, Windows reuses the identical numerical HWND, causing all four fields to match. Documented Windows APIs provide no 64-bit window generation ID, and tracking all window creates/destroys violates privacy principle ADR-2C-03.
 
 ---
 
@@ -364,13 +379,15 @@ Empirical measurement using `sys.getsizeof` on Windows 11 AMD64 yields:
 | **Deque Container (Capacity 64)** | `collections.deque(maxlen=64)` internal block + header | **1,288 bytes** |
 | **Temporary Batch List** | 64 element pointers + list object header during `drain_and_reset()` | **568 bytes** |
 | **Lock Primitive** | `threading.Lock` object header and lock state | **56 bytes** |
-| **Core Queue Data Structures Footprint** | $9,216 + 1,288 + 568 + 56$ | $\mathbf{11,128 \ \text{bytes} \ (10.87 \ \text{KB})}$ |
-| **Instance State Dict & Counters** | `BoundedEventQueue.__dict__` overhead | **~152 bytes** |
-| **Total Queue Heap Footprint** | Core structures + instance attribute dict | $\mathbf{\approx 11.4 \ \text{KB} \ (< 12 \ \text{KB})}$ |
+| **Nominal Core Queue Structures Sum** | $9,216 + 1,288 + 568 + 56$ (integers $< 2^{30}$) | $\mathbf{11,128 \ \text{bytes} \ (10.87 \ \text{KB})}$ |
+| **Upper-Range Core Queue Structures Sum** | $9,728 + 1,288 + 568 + 56$ (integers $\ge 2^{30}$) | $\mathbf{11,640 \ \text{bytes} \ (11.37 \ \text{KB})}$ |
+| **Instance Object & State Dict** | `sys.getsizeof(q)` (48 B) + `sys.getsizeof(q.__dict__)` (296 B) | **344 bytes** |
+| **Dynamic Telemetry Integers (In-Memory)** | Telemetry counter objects under GIL | **~1,680 bytes** |
+| **Total Queue Heap Footprint** | Bounded across all integer ranges | $\mathbf{\approx 13.1\text{--}13.7 \ \text{KB} \ (< 16 \ \text{KB})}$ |
 
 ### 8.3 Clear Separation of Memory Scopes
 To prevent confusing container sizes with system memory bounds, the architecture delineates three separate memory tiers:
-1. **Queue Data Structures Heap Overhead**: $\approx 11.4 \ \text{KB}$ ($< 12 \ \text{KB}$). Strictly bounded in-memory FIFO structures.
+1. **Queue Data Structures Heap Overhead**: Bounded below **$< 16 \ \text{KB}$** ($\approx 10.5\text{--}13.7 \ \text{KB}$). Strictly bounded in-memory FIFO structures.
 2. **Native Win32 Hook & Thread Resources**:
    - 1 `HWINEVENTHOOK` handle (8 bytes in user-mode handle table, ~128 bytes in desktop heap).
    - 1 OS Thread (kernel stack committed 28 KB, user stack committed ~64 KB to 1 MB).

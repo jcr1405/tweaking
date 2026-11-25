@@ -237,7 +237,7 @@ class TestAdvConsentIntegrity(unittest.TestCase):
             ),
             permission_boundary=self.boundary
         )
-        args = {"target": "node_1"}
+        args = {"path": "C:\\temp\\node_1.txt"}
         l2_token = self.boundary.issue_consent_token(l2_tool_id, context=args)
 
         # Attempt to use L2 token to authorize L3 protected delete_file

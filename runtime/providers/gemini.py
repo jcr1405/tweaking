@@ -33,7 +33,13 @@ class GeminiModelProvider(IModelProvider):
         temperature: float = 0.7,
         max_output_tokens: int = 4096
     ):
-        self._model_id = model_id or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        self._model_id = model_id or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
         self._api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY", "")
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
@@ -49,6 +55,9 @@ class GeminiModelProvider(IModelProvider):
 
     def validate_configuration(self) -> Tuple[bool, str]:
         """Validates SDK installation and API key presence without leaking secrets."""
+        from runtime.config import is_local_only_mode
+        if is_local_only_mode():
+            return False, "Cloud inference disabled: Local-only mode is active (PRESENCE_LOCAL_ONLY=1)."
         if not _GENAI_AVAILABLE:
             return False, "Official SDK 'google-genai' is not installed in the current environment."
         if not self._api_key or not self._api_key.strip():
@@ -163,61 +172,94 @@ class GeminiModelProvider(IModelProvider):
             tools=sdk_tools
         )
 
-        try:
-            stream = client.models.generate_content_stream(
-                model=self._model_id,
-                contents=contents,
-                config=config
-            )
+        models_to_try = [self._model_id]
+        for fallback_cand in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash"]:
+            if fallback_cand not in models_to_try:
+                models_to_try.append(fallback_cand)
 
-            for response in stream:
-                if cancellation_token and getattr(cancellation_token, "is_cancelled", False):
-                    logger.info("Gemini stream cancelled by cancellation token.")
-                    break
-
-                text_delta = response.text or ""
-                tool_calls_extracted = []
-
-                if response.function_calls:
-                    for fc in response.function_calls:
-                        ts = None
-                        if hasattr(response, "candidates") and response.candidates:
-                            for cand in response.candidates:
-                                if hasattr(cand, "content") and cand.content and cand.content.parts:
-                                    for part in cand.content.parts:
-                                        if part.function_call and (part.function_call.id == fc.id or part.function_call.name == fc.name):
-                                            ts = getattr(part, "thought_signature", None)
-                                            break
-                        tool_calls_extracted.append({
-                            "call_id": fc.id or f"call_{fc.name}",
-                            "name": fc.name,
-                            "args": fc.args or {},
-                            "thought_signature": ts.hex() if isinstance(ts, bytes) else ts
-                        })
-
-                # Token usage metadata
-                usage_dict = None
-                if hasattr(response, "usage_metadata") and response.usage_metadata:
-                    um = response.usage_metadata
-                    usage_dict = {
-                        "prompt_tokens": getattr(um, "prompt_token_count", 0) or 0,
-                        "completion_tokens": getattr(um, "candidates_token_count", 0) or 0,
-                        "cached_tokens": getattr(um, "cached_content_token_count", 0) or 0
-                    }
-
-                yield ModelStreamChunk(
-                    text_delta=text_delta,
-                    tool_calls=tool_calls_extracted,
-                    usage=usage_dict
+        for attempt_idx, attempt_model in enumerate(models_to_try):
+            try:
+                stream = client.models.generate_content_stream(
+                    model=attempt_model,
+                    contents=contents,
+                    config=config
                 )
 
-        except Exception as e:
-            # Redact any accidental key leakage in exception
-            clean_error = str(e)
-            if self._api_key:
-                clean_error = clean_error.replace(self._api_key, "[REDACTED_API_KEY]")
-            logger.error(f"Gemini generation error: {clean_error}")
-            raise RuntimeError(f"Gemini API generation failed: {clean_error}") from None
+                if attempt_model != self._model_id:
+                    logger.warning(
+                        f"Primary Gemini model '{self._model_id}' unavailable. "
+                        f"Automatically fell back to '{attempt_model}'."
+                    )
+                    yield ModelStreamChunk(
+                        text_delta=f"*[Notice: Temporarily routed to {attempt_model} due to quota / demand limits on {self._model_id}]*\n\n"
+                    )
+
+                for response in stream:
+                    if cancellation_token and getattr(cancellation_token, "is_cancelled", False):
+                        logger.info("Gemini stream cancelled by cancellation token.")
+                        break
+
+                    text_delta = response.text or ""
+                    tool_calls_extracted = []
+
+                    if response.function_calls:
+                        for fc in response.function_calls:
+                            ts = None
+                            if hasattr(response, "candidates") and response.candidates:
+                                for cand in response.candidates:
+                                    if hasattr(cand, "content") and cand.content and cand.content.parts:
+                                        for part in cand.content.parts:
+                                            if part.function_call and (part.function_call.id == fc.id or part.function_call.name == fc.name):
+                                                ts = getattr(part, "thought_signature", None)
+                                                break
+                            tool_calls_extracted.append({
+                                "call_id": fc.id or f"call_{fc.name}",
+                                "name": fc.name,
+                                "args": fc.args or {},
+                                "thought_signature": ts.hex() if isinstance(ts, bytes) else ts
+                            })
+
+                    # Token usage metadata
+                    usage_dict = None
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        um = response.usage_metadata
+                        usage_dict = {
+                            "prompt_tokens": getattr(um, "prompt_token_count", 0) or 0,
+                            "completion_tokens": getattr(um, "candidates_token_count", 0) or 0,
+                            "cached_tokens": getattr(um, "cached_content_token_count", 0) or 0
+                        }
+
+                    yield ModelStreamChunk(
+                        text_delta=text_delta,
+                        tool_calls=tool_calls_extracted,
+                        usage=usage_dict
+                    )
+                # Successful stream completed
+                return
+
+            except Exception as e:
+                clean_error = str(e)
+                if self._api_key:
+                    clean_error = clean_error.replace(self._api_key, "[REDACTED_API_KEY]")
+
+                is_transient = any(
+                    code in clean_error
+                    for code in [
+                        "503", "UNAVAILABLE", "high demand",
+                        "404", "no longer available",
+                        "429", "RESOURCE_EXHAUSTED", "Quota exceeded", "rate-limits", "quota"
+                    ]
+                )
+                if is_transient and attempt_idx < len(models_to_try) - 1:
+                    reason = "quota exhaustion" if ("429" in clean_error or "quota" in clean_error.lower()) else "high demand"
+                    logger.warning(
+                        f"Model '{attempt_model}' failed due to {reason} ({clean_error[:80]}). "
+                        f"Attempting fallback to '{models_to_try[attempt_idx + 1]}'..."
+                    )
+                    continue
+
+                logger.error(f"Gemini generation error: {clean_error}")
+                raise RuntimeError(f"Gemini API generation failed: {clean_error}") from None
 
     def close(self) -> None:
         """Cleans up client resources."""

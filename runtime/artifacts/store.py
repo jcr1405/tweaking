@@ -20,8 +20,9 @@ from runtime.artifacts.models import ArtifactMetadata, ArtifactReadResult
 logger = logging.getLogger("presence.artifacts.store")
 
 # Invariants
-ARTIFACT_THRESHOLD_BYTES = 40960           # 40 KB
+ARTIFACT_THRESHOLD_BYTES = 6144           # 6 KB (~1,500 tokens inline cap)
 MAX_ARTIFACT_SIZE_BYTES = 50 * 1024 * 1024   # 50 MB
+
 MAX_CONVERSATION_BUDGET_BYTES = 200 * 1024 * 1024  # 200 MB
 
 # Regex for safe identifier validation (prevents directory traversal)

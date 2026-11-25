@@ -71,16 +71,25 @@ class EventBus:
                 return True
             return False
 
-    def publish(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Event:
+    def publish(self, event_type: str | Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Event:
         """Publishes an event synchronously to all registered listeners.
         Guarantees that an exception in one handler never halts execution of other handlers.
+        Accepts either explicit (event_type, payload) or a unified dictionary.
         """
+        if isinstance(event_type, dict):
+            ev_dict = event_type
+            ev_type = str(ev_dict.get("event_type", "GENERIC_EVENT"))
+            pay = {k: v for k, v in ev_dict.items() if k != "event_type"}
+        else:
+            ev_type = str(event_type)
+            pay = payload or {}
+
         with self._lock:
             self._sequence_counter += 1
             seq = self._sequence_counter
 
-            event = Event.create(event_type=event_type, sequence_num=seq, payload=payload)
-            type_handlers = list(self._subscribers.get(event_type, []))
+            event = Event.create(event_type=ev_type, sequence_num=seq, payload=pay)
+            type_handlers = list(self._subscribers.get(ev_type, []))
             global_handlers = list(self._global_subscribers)
 
         # Dispatch outside the lock to prevent deadlocks
@@ -91,7 +100,7 @@ class EventBus:
             except Exception as e:
                 logger.error(
                     f"Error in event handler {handler.__name__ if hasattr(handler, '__name__') else str(handler)} "
-                    f"for event {event_type} ({event.event_id}): {e}",
+                    f"for event {ev_type} ({event.event_id}): {e}",
                     exc_info=True,
                 )
 

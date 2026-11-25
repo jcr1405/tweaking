@@ -26,14 +26,16 @@ class TestArtifactStore(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_offload_threshold_detection(self):
-        """Verifies exact 40 KB boundary detection for output offloading."""
-        # Content <= 40960 bytes does not trigger offload
-        small_text = "A" * 40960
+        """Verifies boundary detection for output offloading at ARTIFACT_THRESHOLD_BYTES."""
+        from runtime.artifacts.store import ARTIFACT_THRESHOLD_BYTES
+        # Content <= ARTIFACT_THRESHOLD_BYTES bytes does not trigger offload
+        small_text = "A" * ARTIFACT_THRESHOLD_BYTES
         self.assertFalse(self.store.should_offload(small_text))
 
-        # Content 40961 bytes triggers offload
-        large_text = "A" * 40961
+        # Content ARTIFACT_THRESHOLD_BYTES + 1 bytes triggers offload
+        large_text = "A" * (ARTIFACT_THRESHOLD_BYTES + 1)
         self.assertTrue(self.store.should_offload(large_text))
+
 
     def test_atomic_artifact_storage_and_metadata(self):
         """Verifies atomic write, SHA-256 calculation, and metadata sidecar persistence."""

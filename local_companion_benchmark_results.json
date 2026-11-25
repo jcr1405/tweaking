@@ -1,0 +1,29 @@
+{
+  "test1_persona": {
+    "latency_s": 86.81383204460144,
+    "eval_count": 1460,
+    "tokens_per_second": 21.054252467972983,
+    "sample": "Good morning! It\u2019s wonderful to see you settled in at your desk.\n\nAs **Presence**, my role is to be a quiet, helpful layer between you and your operating system. Here are my primary goals for today:\n\n1.  **Maintain Situational Awareness:** I want to understand what\u2019s currently open on your screen, w"
+  },
+  "test2_tool_calling": {
+    "tool_calls_count": 1,
+    "tool_calls": [
+      {
+        "id": "call_pfu569gz",
+        "function": {
+          "index": 0,
+          "name": "desktop.observe",
+          "arguments": {
+            "window_title": "Browser"
+          }
+        }
+      }
+    ],
+    "latency_s": 6.424274206161499
+  },
+  "test3_routine": {
+    "latency_s": 95.80391454696655,
+    "tokens_per_second": 21.31925164269865,
+    "sample": "Opening YouTube via Chrome Default Profile...  \n1. Press **Win + R** to open the Run dialog.  \n2. Type `chrome --profile-directory='Default' https://www.youtube.com` and press **Enter**.  \n3. Wait for the YouTube page to load (look for \"YouTube - Google Chrome\" in the title bar).  \n\nOnce YouTube is "
+  }
+}

@@ -89,9 +89,9 @@ def get_default_conversations_dir() -> Path:
 class TrajectoryStore:
     """Conversation-scoped relational SQLite store for execution trajectories."""
 
-    def __init__(self, conversation_id: str, db_dir: Optional[Path] = None):
+    def __init__(self, conversation_id: str, db_dir: Optional[Any] = None):
         self.conversation_id = conversation_id
-        self.db_dir = db_dir or get_default_conversations_dir()
+        self.db_dir = Path(db_dir) if db_dir else get_default_conversations_dir()
         self.db_path = self.db_dir / f"{conversation_id}.db"
         self._conn: Optional[sqlite3.Connection] = None
         self._init_database()

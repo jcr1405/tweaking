@@ -1,0 +1,57 @@
+{
+  "version": "1.0",
+  "servers": [
+    {
+      "server_id": "filesystem",
+      "name": "Presence Local Filesystem Server",
+      "command": "python",
+      "args": ["-m", "runtime.mcp.servers.filesystem_server"],
+      "cwd": null,
+      "env": {},
+      "startup_timeout": 15.0,
+      "request_timeout": 30.0,
+      "shutdown_timeout": 5.0,
+      "max_restarts": 3,
+      "restart_backoff_seconds": 1.0,
+      "enabled": true,
+      "default_authority_tier": "L0_OBSERVE",
+      "tool_tiers": {
+        "read_file": "L0_OBSERVE",
+        "read_multiple_files": "L0_OBSERVE",
+        "list_directory": "L0_OBSERVE",
+        "get_file_info": "L0_OBSERVE",
+        "search_files": "L0_OBSERVE",
+        "write_file": "L2_EXECUTE_REVERSIBLE",
+        "edit_file": "L2_EXECUTE_REVERSIBLE",
+        "create_directory": "L2_EXECUTE_REVERSIBLE",
+        "move_file": "L2_EXECUTE_REVERSIBLE",
+        "delete_file": "L2_EXECUTE_REVERSIBLE"
+      },
+      "approved_tools": null,
+      "auto_approve_tools": true
+    },
+    {
+      "server_id": "shell",
+      "name": "Presence Windows Shell Server",
+      "command": "python",
+      "args": ["-m", "runtime.mcp.servers.shell_server"],
+      "cwd": null,
+      "env": {},
+      "startup_timeout": 15.0,
+      "request_timeout": 60.0,
+      "shutdown_timeout": 5.0,
+      "max_restarts": 3,
+      "restart_backoff_seconds": 1.0,
+      "enabled": true,
+      "default_authority_tier": "L2_EXECUTE_REVERSIBLE",
+      "tool_tiers": {
+        "get_system_info": "L0_OBSERVE",
+        "which": "L0_OBSERVE",
+        "execute_command": "L2_EXECUTE_REVERSIBLE",
+        "run_powershell_script": "L2_EXECUTE_REVERSIBLE"
+      },
+      "approved_tools": null,
+      "auto_approve_tools": true
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "metadata": {
+    "subsystem": "Presence Visual Perception Baseline",
+    "phase": "2E.2 Baseline",
+    "environment": "Windows 11 Pro, Python 3.12.10, Ollama qwen3.5:9b",
+    "samples_per_component": 20
+  },
+  "window_enumeration_ms": {
+    "median": 0.66,
+    "p95": 0.99,
+    "min": 0.54,
+    "max": 1.66,
+    "samples": 20
+  },
+  "uia_tree_inspection_ms": {
+    "median": 35.46,
+    "p95": 43.28,
+    "min": 33.39,
+    "max": 113.07,
+    "samples": 20
+  },
+  "window_capture_ms": {
+    "median": 68.28,
+    "p95": 75.28,
+    "min": 63.53,
+    "max": 77.01,
+    "samples": 20
+  },
+  "sendinput_dispatch_ms": {
+    "median": 51.82,
+    "p95": 52.8,
+    "min": 51.43,
+    "max": 52.85,
+    "samples": 20
+  },
+  "qwen_multimodal_vision_ms": {
+    "median": 42619.48,
+    "p95": 51983.36,
+    "min": 32215.18,
+    "max": 53023.79,
+    "samples": 2,
+    "notes": "Unoptimized full 1080p frame multimodal LLM visual coordinate grounding"
+  },
+  "end_to_end_vision_loop_baseline_ms": {
+    "median": 42789.58,
+    "notes": "Capture + Qwen Vision + SendInput + Verification settle delay"
+  }
+}

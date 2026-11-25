@@ -19,9 +19,48 @@ from runtime.permissions import (
 logger = logging.getLogger("presence.tools.registry")
 
 
+def normalize_json_schema(schema: Any) -> Any:
+    """Recursively normalizes JSON Schema casing (e.g. Gemini UPPERCASE types to standard lowercase)."""
+    if not isinstance(schema, dict):
+        return schema
+    normalized = {}
+    for k, v in schema.items():
+        if k == "type" and isinstance(v, str):
+            normalized[k] = v.lower()
+        elif isinstance(v, dict):
+            normalized[k] = normalize_json_schema(v)
+        elif isinstance(v, list):
+            normalized[k] = [normalize_json_schema(item) if isinstance(item, dict) else item for item in v]
+        else:
+            normalized[k] = v
+    return normalized
+
+
+def validate_tool_arguments_schema(args: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """Validates tool arguments against a JSON schema.
+    Raises ValueError on validation failure.
+    """
+    if not schema or not isinstance(schema, dict):
+        return
+    norm_schema = normalize_json_schema(schema)
+    try:
+        import jsonschema
+        jsonschema.validate(instance=args, schema=norm_schema)
+    except ImportError:
+        # Fallback basic required properties check if jsonschema is missing
+        required = norm_schema.get("required", [])
+        for req in required:
+            if req not in args:
+                raise ValueError(f"'{req}' is a required property")
+    except jsonschema.ValidationError as e:
+        raise ValueError(e.message) from e
+    except jsonschema.SchemaError as e:
+        raise ValueError(f"Malformed schema: {e.message}") from e
+
+
 @dataclass
 class ToolDefinition:
-    """Strongly typed tool definition with authority requirements."""
+    """Strongly typed tool definition with authority requirements and concurrency metadata."""
     tool_id: str
     name: str
     description: str
@@ -29,6 +68,15 @@ class ToolDefinition:
     authority_tier: PermissionTier
     handler: Callable[[Dict[str, Any]], Dict[str, Any]]
     timeout_seconds: float = 10.0
+    read_only: bool = False
+    idempotent: bool = False
+    concurrency_group: Optional[str] = None
+    max_parallel: int = 5
+
+    def __post_init__(self):
+        # Infer read_only automatically for observation/query tools if not explicitly set
+        if not self.read_only and self.authority_tier in (PermissionTier.L0_OBSERVE, getattr(PermissionTier, "L1_RECOMMEND", 1)):
+            self.read_only = True
 
     def to_declaration(self) -> Dict[str, Any]:
         """Converts definition to model function declaration schema."""
@@ -66,8 +114,13 @@ class ToolRegistry:
         return False
 
     def get_tool(self, tool_id: str) -> Optional[ToolDefinition]:
-        """Retrieves a tool definition by ID."""
-        return self._tools.get(tool_id)
+        """Retrieves a tool definition by ID or name."""
+        if tool_id in self._tools:
+            return self._tools[tool_id]
+        for t in self._tools.values():
+            if t.name == tool_id:
+                return t
+        return None
 
     def list_tools(self) -> List[ToolDefinition]:
         """Returns all registered tool definitions."""
@@ -83,12 +136,25 @@ class ToolRegistry:
         args: Dict[str, Any],
         permission_boundary: PermissionBoundary,
         consent_token: Optional[str] = None,
-        conversation_id: str = ""
+        conversation_id: str = "",
+        call_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Validates, authorizes, and executes a requested tool.
         Returns a structured result envelope:
         {"status": "SUCCESS" | "ERROR", "result": Any, "error": Optional[str]}
         """
+        # Set context variables for delegation tools if provided
+        tok_call = None
+        tok_conv = None
+        try:
+            from runtime.tools.delegation_tools import current_tool_call_id, current_conversation_id
+            if call_id and current_tool_call_id.get() is None:
+                tok_call = current_tool_call_id.set(call_id)
+            if conversation_id and current_conversation_id.get() is None:
+                tok_conv = current_conversation_id.set(conversation_id)
+        except ImportError:
+            pass
+
         tool = self.get_tool(tool_id)
         if not tool:
             err_msg = f"Tool '{tool_id}' is not registered in the tool catalog."
@@ -104,6 +170,19 @@ class ToolRegistry:
             err_msg = f"Argument validation and canonicalization failed for '{tool_id}': {e}"
             logger.warning(err_msg)
             return {"status": "ERROR", "error": err_msg}
+
+        # Step 1b: Validate arguments against JSON Schema definition if declared
+        if tool.parameters and isinstance(tool.parameters, dict):
+            schema_props = tool.parameters.get("properties")
+            schema_req = tool.parameters.get("required")
+            schema_type = tool.parameters.get("type")
+            if schema_props is not None or schema_req is not None or schema_type is not None:
+                try:
+                    validate_tool_arguments_schema(authorized_args, tool.parameters)
+                except Exception as val_err:
+                    err_msg = f"Argument schema validation failed for '{tool_id}': {val_err}"
+                    logger.warning(err_msg)
+                    return {"status": "ERROR", "error": err_msg}
 
         # Step 2: Ensure policy is registered in boundary
         if tool.tool_id not in permission_boundary._policies:
@@ -150,6 +229,15 @@ class ToolRegistry:
             err_msg = f"Error during tool execution: {str(e)}"
             logger.error(f"Tool execution failed for '{tool_id}': {e}")
             return {"status": "ERROR", "error": err_msg}
+        finally:
+            try:
+                from runtime.tools.delegation_tools import current_tool_call_id, current_conversation_id
+                if tok_call is not None:
+                    current_tool_call_id.reset(tok_call)
+                if tok_conv is not None:
+                    current_conversation_id.reset(tok_conv)
+            except ImportError:
+                pass
 
 
 def build_default_tools(

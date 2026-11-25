@@ -41,7 +41,8 @@ class FakeModelProvider(IModelProvider):
         system_prompt: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        cancellation_token: Optional[Any] = None
+        cancellation_token: Optional[Any] = None,
+        **kwargs: Any
     ) -> Iterator[ModelStreamChunk]:
         """Yields predetermined chunks or simulated errors."""
         self._call_count += 1

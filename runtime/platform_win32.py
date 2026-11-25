@@ -547,14 +547,22 @@ class Win32SuspendedLauncher:
         kernel32.TerminateProcess.restype = wintypes.BOOL
 
         # 1. Resolve executable path
-        resolved_exe = shutil.which(command)
-        if not resolved_exe:
-            if os.path.isabs(command) and os.path.exists(command):
-                resolved_exe = command
-            else:
-                raise FileNotFoundError(f"Cannot resolve executable command '{command}'")
+        if command.lower() in ("python", "python3", "python.exe") and sys.executable:
+            resolved_exe = sys.executable
+        else:
+            resolved_exe = shutil.which(command)
+            if not resolved_exe:
+                if os.path.isabs(command) and os.path.exists(command):
+                    resolved_exe = command
+                else:
+                    raise FileNotFoundError(f"Cannot resolve executable command '{command}'")
 
         # 2. Validate working directory
+        if not cwd:
+            from pathlib import Path
+            proj_root = Path(__file__).resolve().parent.parent
+            if (proj_root / "runtime").exists():
+                cwd = str(proj_root)
         if cwd and not os.path.isdir(cwd):
             raise FileNotFoundError(f"Specified working directory does not exist: '{cwd}'")
 
@@ -635,15 +643,17 @@ class Win32SuspendedLauncher:
 
         # 7. Prepare Job Object
         active_job = job
-        if not active_job:
-            jname = job_name or f"Presence_Job_{int(time.time()*1000)}"
-            active_job = Win32JobObject(name=jname)
-            if not active_job.create(kill_on_close=True):
-                err = kernel32.GetLastError()
-                kernel32.DeleteProcThreadAttributeList(p_attr_list)
-                for h in (h_stdin_read, h_stdin_write, h_stdout_read, h_stdout_write, h_stderr_read, h_stderr_write):
-                    kernel32.CloseHandle(h)
-                raise RuntimeError(f"Failed to create Job Object '{jname}': error {err}")
+        if not active_job or not getattr(active_job, "handle", None):
+            jname = (job.name if job else None) or job_name or f"Presence_Job_{int(time.time()*1000)}"
+            if not active_job:
+                active_job = Win32JobObject(name=jname)
+            if not active_job.handle:
+                if not active_job.create(kill_on_close=True):
+                    err = kernel32.GetLastError()
+                    kernel32.DeleteProcThreadAttributeList(p_attr_list)
+                    for h in (h_stdin_read, h_stdin_write, h_stdout_read, h_stdout_write, h_stderr_read, h_stderr_write):
+                        kernel32.CloseHandle(h)
+                    raise RuntimeError(f"Failed to create Job Object '{jname}': error {err}")
 
         # 8. Create Process Suspended
         pi = PROCESS_INFORMATION()
@@ -732,5 +742,55 @@ class Win32SuspendedLauncher:
             h_stdout_read=h_stdout_read,
             h_stderr_read=h_stderr_read,
         )
+
+
+class _CREDENTIAL_W(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", wintypes.FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+
+def read_windows_credential(target_name: str, user_name: Optional[str] = None) -> Optional[str]:
+    """Reads a generic password credential from Windows Credential Manager via advapi32.CredReadW.
+    Returns the decoded credential string or None if not found or on non-Windows platforms.
+    """
+    if sys.platform != "win32":
+        return None
+
+    try:
+        advapi32 = ctypes.windll.advapi32
+        pcred = ctypes.POINTER(_CREDENTIAL_W)()
+        # CRED_TYPE_GENERIC = 1
+        res = advapi32.CredReadW(target_name, 1, 0, ctypes.byref(pcred))
+        if not res:
+            return None
+
+        try:
+            cred = pcred.contents
+            if user_name and cred.UserName and cred.UserName.lower() != user_name.lower():
+                return None
+            if not cred.CredentialBlob or cred.CredentialBlobSize == 0:
+                return None
+            raw_blob = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+            try:
+                return raw_blob.decode("utf-16le")
+            except UnicodeDecodeError:
+                return raw_blob.decode("utf-8", errors="ignore")
+        finally:
+            advapi32.CredFree(pcred)
+    except Exception:
+        return None
+
 
 

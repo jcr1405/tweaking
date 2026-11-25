@@ -18,7 +18,7 @@ from runtime.mcp.models import (
 from runtime.mcp.client import MCPClientSession
 from runtime.mcp.schemas import SchemaCache
 from runtime.permissions import PermissionBoundary, PermissionTier, ActionPolicy
-from runtime.tools.registry import ToolRegistry, ToolDefinition
+from runtime.tools.registry import ToolRegistry, ToolDefinition, validate_tool_arguments_schema
 
 logger = logging.getLogger("presence.mcp.supervisor")
 
@@ -59,8 +59,11 @@ class MCPSupervisor:
 
         logger.info(f"Registered MCP server configuration '{config.server_id}' ({config.name}). Cached tools: {len(cached_tools)}")
 
-    def unregister_server(self, server_id: str) -> bool:
-        """Stops and unregisters an MCP server."""
+    def unregister_server(self, server_id: str, tool_registry: Optional[ToolRegistry] = None) -> bool:
+        """Stops and unregisters an MCP server, optionally pruning its tools from a ToolRegistry."""
+        if tool_registry:
+            self.unregister_tools_from_registry(tool_registry, server_id=server_id)
+
         if server_id in self._sessions:
             self.stop_server(server_id)
             del self._sessions[server_id]
@@ -72,6 +75,55 @@ class MCPSupervisor:
             del self._discovered_tools[server_id]
         logger.info(f"Unregistered MCP server '{server_id}'")
         return True
+
+    def disable_server(self, server_id: str, tool_registry: Optional[ToolRegistry] = None) -> bool:
+        """Explicitly disables an MCP server, stops any running process, and prunes tools from ToolRegistry."""
+        with self._get_server_lock(server_id):
+            config = self._configs.get(server_id)
+            if not config:
+                logger.warning(f"Cannot disable unknown MCP server '{server_id}'")
+                return False
+
+            config.enabled = False
+            self.stop_server(server_id)
+            if tool_registry:
+                self.unregister_tools_from_registry(tool_registry, server_id=server_id)
+            logger.info(f"Disabled MCP server '{server_id}'")
+            return True
+
+    def enable_server(
+        self,
+        server_id: str,
+        tool_registry: Optional[ToolRegistry] = None,
+        permission_boundary: Optional[PermissionBoundary] = None
+    ) -> bool:
+        """Explicitly enables a previously disabled MCP server and optionally registers its tools."""
+        with self._get_server_lock(server_id):
+            config = self._configs.get(server_id)
+            if not config:
+                logger.warning(f"Cannot enable unknown MCP server '{server_id}'")
+                return False
+
+            config.enabled = True
+            if tool_registry and permission_boundary:
+                self.register_tools_with_registry(tool_registry, permission_boundary, server_id=server_id)
+            logger.info(f"Enabled MCP server '{server_id}'")
+            return True
+
+    def unregister_tools_from_registry(
+        self,
+        tool_registry: ToolRegistry,
+        server_id: Optional[str] = None
+    ) -> List[str]:
+        """Prunes registered MCP tools from a ToolRegistry for a specific server or all servers."""
+        prefix = f"mcp.{server_id}." if server_id else "mcp."
+        removed: List[str] = []
+        for tool in list(tool_registry.list_tools()):
+            if tool.tool_id.startswith(prefix):
+                tool_registry.unregister(tool.tool_id)
+                removed.append(tool.tool_id)
+                logger.info(f"Pruned tool '{tool.tool_id}' from ToolRegistry")
+        return removed
 
     def get_server_config(self, server_id: str) -> Optional[MCPServerConfig]:
         """Retrieves server configuration."""
@@ -170,6 +222,14 @@ class MCPSupervisor:
             if not config:
                 return {"status": "ERROR", "error": f"MCP server '{server_id}' is not configured."}
 
+            if not config.enabled:
+                return {
+                    "status": "ERROR",
+                    "error": f"MCP server '{server_id}' is disabled in configuration.",
+                    "server_id": server_id,
+                    "tool": tool_name
+                }
+
             # Check explicit tool approval policy (default-deny)
             if not config.is_tool_approved(tool_name):
                 logger.warning(f"Rejected execution of unapproved MCP tool '{tool_name}' on server '{server_id}' (default-deny).")
@@ -179,6 +239,21 @@ class MCPSupervisor:
                     "server_id": server_id,
                     "tool": tool_name
                 }
+
+            # Defense-in-depth: Validate arguments against discovered tool schema if available
+            tool_info = self._discovered_tools.get(server_id, {}).get(tool_name)
+            if tool_info and tool_info.input_schema and isinstance(tool_info.input_schema, dict):
+                try:
+                    validate_tool_arguments_schema(args, tool_info.input_schema)
+                except ValueError as val_err:
+                    err_msg = f"Argument validation failed for MCP tool '{tool_name}': {val_err}"
+                    logger.warning(err_msg)
+                    return {
+                        "status": "ERROR",
+                        "error": err_msg,
+                        "server_id": server_id,
+                        "tool": tool_name
+                    }
 
             # Lazy startup if not currently running
             session = self._sessions.get(server_id)

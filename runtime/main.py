@@ -19,6 +19,13 @@ if sys.path and sys.path[0] == str(script_dir):
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+# Automatically load environment variables from .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv(project_root / ".env")
+except ImportError:
+    pass
+
 from runtime.lifecycle import PresenceRuntime, RuntimeState
 from runtime.conversation import ConversationMetadata
 from runtime.trajectory import TrajectoryStore
@@ -28,7 +35,10 @@ from runtime.reconstruction import ContextAssembler
 from runtime.permissions import PermissionBoundary
 from runtime.tools.registry import build_default_tools
 from runtime.providers.gemini import GeminiModelProvider
+from runtime.providers.freellmapi import FreeLLMAPIProvider
+from runtime.providers.ollama import OllamaModelProvider
 from runtime.providers.fake import FakeModelProvider
+from runtime.providers.coordinator import MultiProviderCoordinator
 from runtime.agent_executor import AgentExecutor, CancellationToken
 from runtime.artifacts.store import ArtifactStore
 from runtime.mcp.schemas import SchemaCache
@@ -98,6 +108,11 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         help="Lists all tools discovered across registered MCP servers",
     )
     parser.add_argument(
+        "--search-status",
+        action="store_true",
+        help="Displays operational health, rate limiter status, circuit state, and cache metrics of the Search Traffic Governor",
+    )
+    parser.add_argument(
         "--artifact-list",
         type=str,
         help="Lists all offloaded execution artifacts for a given conversation UUID",
@@ -120,18 +135,47 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Enable native Windows foreground window awareness (Phase 2C.1)",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch the full-screen interactive Terminal Control Center",
+    )
 
     parsed_args = parser.parse_args(args)
 
-    # 1. Standalone Provider Check (Can run without starting full daemon)
+    # 1. Standalone Multi-Provider Coordinator Check
     if parsed_args.provider_check:
-        gemini = GeminiModelProvider()
-        valid, msg = gemini.validate_configuration()
-        print("=== AI Provider Health Check ===")
-        print(f"Provider:   {gemini.provider_name}")
-        print(f"Model ID:   {gemini.model_id}")
-        print(f"Ready:      {'YES' if valid else 'NO'}")
-        print(f"Details:    {msg}")
+        from runtime.config import is_local_only_mode
+        local_only = is_local_only_mode()
+        provs = {}
+        pref = ("ollama" if local_only else os.environ.get("PRESENCE_PROVIDER", "freellmapi")).lower()
+        provider_classes = [("ollama", OllamaModelProvider)] if local_only else [
+            ("ollama", OllamaModelProvider), ("freellmapi", FreeLLMAPIProvider), ("gemini", GeminiModelProvider)
+        ]
+        for name, cls in provider_classes:
+            try:
+                p = cls()
+                v, m = p.validate_configuration()
+                if v:
+                    provs[name] = p
+            except Exception:
+                pass
+
+        primary = pref if pref in provs else (next(iter(provs)) if provs else "none")
+        fallbacks = [p for p in (["ollama"] if local_only else ["ollama", "gemini", "freellmapi"]) if p != primary and p in provs]
+        coord = MultiProviderCoordinator(
+            providers=provs,
+            primary_provider=primary,
+            fallback_order=fallbacks
+        )
+        valid, msg = coord.validate_configuration()
+        print("=== AI Multi-Provider Coordinator Health Check ===")
+        print(f"Local-Only Mode:    {'ACTIVE (Strict Local Inference)' if local_only else 'DISABLED (Cloud Enabled)'}")
+        print(f"Active Provider:    {coord.active_provider_name}")
+        print(f"Primary Provider:   {coord.primary_provider_name}")
+        print(f"Fallback Order:     {', '.join(fallbacks) if fallbacks else 'None'}")
+        print(f"Ready:              {'YES' if valid else 'NO'}")
+        print(f"Details:            {msg}")
         return 0 if valid else 1
 
     # 2. Standalone Live Gemini Test
@@ -159,8 +203,15 @@ def run_cli(args: Optional[List[str]] = None) -> int:
 
     # 3. Supervised MCP Diagnostics
     if parsed_args.mcp_status:
+        from runtime.mcp.config import load_mcp_configuration
         cache = SchemaCache()
         supervisor = MCPSupervisor(schema_cache=cache)
+        try:
+            configs = load_mcp_configuration()
+            for cfg in configs:
+                supervisor.register_server(cfg)
+        except Exception as e:
+            print(f"[Presence] Error loading MCP configuration: {e}", file=sys.stderr)
         statuses = supervisor.get_all_statuses()
         print("=== Supervised MCP Servers ===")
         if not statuses:
@@ -214,6 +265,27 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         print(meta.preview)
         return 0
 
+    # 4. Search Traffic Governor Diagnostics
+    if parsed_args.search_status:
+        from runtime.search import SearchGovernor
+        gov = SearchGovernor()
+        st = gov.get_status()
+        gov.close()
+        print("=== Search Traffic Governor Status ===")
+        print(f"Provider:                {st['provider']}")
+        print(f"Circuit State:           {st['circuit_state']}")
+        print(f"Cooldown Remaining:      {st['cooldown_remaining_seconds']:.1f}s")
+        print(f"Requests (Last Minute):  {st['search_requests_last_minute']}")
+        print(f"In-Flight Searches:      {st['search_in_flight']}")
+        print(f"Queued Searches:         {st['search_queued']}")
+        print(f"Total Searches:          {st['total_searches']} (Success: {st['successful_searches']}, Failed: {st['failed_searches']})")
+        print(f"Total Fetches:           {st['total_fetches']} (Success: {st['successful_fetches']}, Failed: {st['failed_fetches']})")
+        print(f"Cache Performance:       Hits: {st['cache_hits']} | Misses: {st['cache_misses']} | Entries: {st['cache_entries']}")
+        print(f"Deduplicated Requests:   {st['deduplicated_requests']}")
+        if st.get("last_error_category"):
+            print(f"Last Error Category:     {st['last_error_category']}")
+        return 0
+
     # Start runtime lifecycle for database / command operations
     runtime = PresenceRuntime(
         mutex_name=parsed_args.mutex_name,
@@ -227,6 +299,13 @@ def run_cli(args: Optional[List[str]] = None) -> int:
 
     try:
         summary_mgr = GlobalSummaryManager()
+
+        # 4b. Terminal Control Center (TUI)
+        if parsed_args.tui:
+            from runtime.tui import PresenceControlCenterApp
+            app = PresenceControlCenterApp(runtime=runtime)
+            app.run()
+            return 0
 
         # 5. Create Conversation
         if parsed_args.create_conversation:
@@ -277,52 +356,11 @@ def run_cli(args: Optional[List[str]] = None) -> int:
         # 8. Interactive Agent Chat
         if parsed_args.chat:
             conv_id = parsed_args.chat
-            rec = summary_mgr.get_summary(conv_id)
-            if not rec:
-                meta = ConversationMetadata(conversation_id=conv_id, title="Interactive Chat")
-                store = TrajectoryStore(conversation_id=conv_id)
-                store.save_metadata(meta)
-                summary_mgr.upsert_summary(conv_id, meta.title)
-            else:
-                store = TrajectoryStore(conversation_id=conv_id)
+            with runtime.create_session(conversation_id=conv_id) as session:
+                print(f"=== Interactive Chat Session: {session.conversation_id} ===")
+                print(f"Model Provider: {session.model_provider.provider_name} ({session.model_provider.model_id})")
+                print("Type your message. Type 'exit' to quit.\n")
 
-            journal = EventJournal(conversation_id=conv_id)
-            artifact_store = ArtifactStore()
-            boundary = PermissionBoundary()
-            registry = build_default_tools(
-                runtime_status_fn=lambda: {
-                    "state": runtime.state.name,
-                    "pid": runtime.pid,
-                    "memory_mb": runtime.get_memory_info().working_set_mb
-                },
-                conversation_info_fn=lambda: {
-                    "conversation_id": conv_id,
-                    "step_count": store.get_step_count()
-                },
-                search_conversations_fn=lambda q, lim: summary_mgr.search_conversations(q, lim),
-                permission_boundary=boundary
-            )
-
-            # Check if Gemini is configured; otherwise use Fake provider
-            gemini = GeminiModelProvider()
-            valid, _ = gemini.validate_configuration()
-            provider = gemini if valid else FakeModelProvider()
-
-            executor = AgentExecutor(
-                trajectory_store=store,
-                event_journal=journal,
-                summary_manager=summary_mgr,
-                permission_boundary=boundary,
-                tool_registry=registry,
-                model_provider=provider,
-                artifact_store=artifact_store
-            )
-
-            print(f"=== Interactive Chat Session: {conv_id} ===")
-            print(f"Model Provider: {provider.provider_name} ({provider.model_id})")
-            print("Type your message. Type 'exit' to quit.\n")
-
-            try:
                 while True:
                     try:
                         user_prompt = input("you> ").strip()
@@ -336,7 +374,7 @@ def run_cli(args: Optional[List[str]] = None) -> int:
                     token = CancellationToken()
                     print("presence> ", end="", flush=True)
                     try:
-                        for event in executor.execute_turn(user_prompt, cancellation_token=token):
+                        for event in session.execute_turn(user_prompt, cancellation_token=token):
                             if event.event_type == "TEXT_DELTA":
                                 print(event.payload.get("delta", ""), end="", flush=True)
                             elif event.event_type == "TOOL_REQUESTED":
@@ -351,9 +389,6 @@ def run_cli(args: Optional[List[str]] = None) -> int:
                     except KeyboardInterrupt:
                         token.cancel()
                         print("\n[Turn cancelled by user]")
-            finally:
-                store.close()
-                journal.close()
             return 0
 
         # 9. Quick Status Flag

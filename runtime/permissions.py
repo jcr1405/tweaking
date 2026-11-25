@@ -10,8 +10,8 @@ import time
 import secrets
 import hashlib
 import threading
-from typing import Dict, Optional, Any, Callable
-from dataclasses import dataclass
+from typing import Dict, Optional, Any, Callable, List, Tuple
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("presence.permissions")
 
@@ -49,6 +49,10 @@ class AuthorizationResult:
     level: AuthorityLevel
     reason: str
     user_consent_required: bool = False
+
+    def __iter__(self):
+        yield self.allowed
+        yield self.reason
 
 
 def _validate_and_normalize_canonical_data(obj: Any) -> Any:
@@ -114,6 +118,47 @@ class IssuedConsent:
     expires_at: float
 
 
+@dataclass
+class TaskScopedConsent:
+    """One-time task-scoped authorization granting bounded autonomy for multi-step desktop workflows."""
+    task_id: str
+    objective: str
+    target_apps: list = field(default_factory=list)  # e.g. ["chrome.exe", "msedge.exe", "explorer.exe"]
+    allowed_action_types: list = field(default_factory=list)  # e.g. ["CLICK", "TYPE", "KEY_COMBINATION", "NAVIGATE"]
+    max_action_budget: int = 20
+    actions_consumed: int = 0
+    expires_at: float = 0.0
+    is_revoked: bool = False
+
+    def validate_and_consume(self, action_name: str, context: Optional[Dict[str, Any]] = None) -> tuple:
+        """Validates that the requested action is within this task's scope and budget."""
+        now = time.monotonic()
+        if self.is_revoked:
+            return False, "Task-scoped consent has been revoked."
+        if self.expires_at > 0 and now > self.expires_at:
+            return False, f"Task-scoped consent expired {now - self.expires_at:.1f}s ago."
+        if self.actions_consumed >= self.max_action_budget:
+            return False, f"Task-scoped action budget exhausted ({self.actions_consumed}/{self.max_action_budget} actions used)."
+
+        # Check target app if specified in context
+        ctx = context or {}
+        app_name = ctx.get("process_name") or ctx.get("app_name") or ctx.get("target_app")
+        if app_name and self.target_apps:
+            norm_targets = [t.lower().removesuffix(".exe") for t in self.target_apps]
+            if not any(t in app_name.lower() for t in norm_targets):
+                return False, f"Target application '{app_name}' is outside approved task scope ({self.target_apps})."
+
+        # Check action type (e.g. desktop actions or action_name)
+        action_type = ctx.get("action_type")
+        if action_type and self.allowed_action_types:
+            norm_allowed = [a.lower() for a in self.allowed_action_types]
+            if action_type.lower() not in norm_allowed:
+                return False, f"Action type '{action_type}' is not permitted by task scope ({self.allowed_action_types})."
+
+        self.actions_consumed += 1
+        return True, f"Action authorized under task-scoped consent [{self.actions_consumed}/{self.max_action_budget} used]."
+
+
 ConsentProvider = Callable[[str, Dict[str, Any]], bool]
 
 
@@ -124,8 +169,32 @@ class PermissionBoundary:
         self._policies: Dict[str, ActionPolicy] = {}
         self._consent_provider = consent_provider
         self._active_consent_tokens: Dict[str, IssuedConsent] = {}
+        self._active_task_consents: Dict[str, TaskScopedConsent] = {}
         self._lock = threading.Lock()
         self._register_default_policies()
+
+    def register_task_consent(self, consent: TaskScopedConsent) -> None:
+        """Registers a bounded task-scoped consent granting autonomy for a specific task."""
+        with self._lock:
+            self._active_task_consents[consent.task_id] = consent
+        logger.info(
+            f"Registered task-scoped consent for task '{consent.task_id}' "
+            f"[budget={consent.max_action_budget}, apps={consent.target_apps}]"
+        )
+
+    def get_task_consent(self, task_id: str) -> Optional[TaskScopedConsent]:
+        """Retrieves active task-scoped consent by task ID."""
+        with self._lock:
+            return self._active_task_consents.get(task_id)
+
+    def revoke_task_consent(self, task_id: str) -> None:
+        """Explicitly revokes active task-scoped consent."""
+        with self._lock:
+            consent = self._active_task_consents.get(task_id)
+            if consent:
+                consent.is_revoked = True
+                del self._active_task_consents[task_id]
+        logger.info(f"Revoked task-scoped consent for task '{task_id}'.")
 
     def _cleanup_expired_tokens_locked(self, now: Optional[float] = None) -> None:
         """Purges expired consent tokens from the internal registry."""
@@ -253,10 +322,16 @@ class PermissionBoundary:
         self.register_policy(ActionPolicy("system.status", AuthorityLevel.L0_OBSERVE, "Query runtime and health metrics"))
         self.register_policy(ActionPolicy("config.read", AuthorityLevel.L0_OBSERVE, "Read runtime configuration"))
         self.register_policy(ActionPolicy("help.read", AuthorityLevel.L0_OBSERVE, "Read available commands"))
+        self.register_policy(ActionPolicy("desktop.list_windows", AuthorityLevel.L0_OBSERVE, "Discover running application windows"))
+        self.register_policy(ActionPolicy("desktop.observe", AuthorityLevel.L0_OBSERVE, "Inspect window accessibility tree and visual state"))
+        self.register_policy(ActionPolicy("desktop.perceive", AuthorityLevel.L0_OBSERVE, "Run local multimodal vision inference"))
+        self.register_policy(ActionPolicy("desktop.verify", AuthorityLevel.L0_OBSERVE, "Verify desktop state transitions and assertions"))
 
         # L2: Execute Reversible
+        self.register_policy(ActionPolicy("presence.shell.execute", AuthorityLevel.L2_EXECUTE_REVERSIBLE, "Run managed shell command"))
         self.register_policy(ActionPolicy("config.write", AuthorityLevel.L2_EXECUTE_REVERSIBLE, "Update persistent configuration"))
         self.register_policy(ActionPolicy("runtime.shutdown", AuthorityLevel.L2_EXECUTE_REVERSIBLE, "Order graceful shutdown"))
+        self.register_policy(ActionPolicy("desktop.execute_actions", AuthorityLevel.L2_EXECUTE_REVERSIBLE, "Execute verified desktop interactions"))
 
         # L3: Protected
         self.register_policy(ActionPolicy("system.process_kill", AuthorityLevel.L3_PROTECTED, "Terminate external system process", requires_explicit_consent=True))
@@ -269,20 +344,47 @@ class PermissionBoundary:
 
     def check_permission(
         self,
-        action_name: str,
+        action_name: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         granted_consent: bool = False,
+        tool_name: Optional[str] = None,
     ) -> AuthorizationResult:
         """Evaluates whether an action is permitted under the active authority matrix."""
-        policy = self._policies.get(action_name)
+        effective_name = action_name or tool_name or "unknown"
+        policy = self._policies.get(effective_name)
         if not policy:
-            logger.warning(f"Unregistered action requested: {action_name}. Rejecting by default (fail-closed).")
+            logger.warning(f"Unregistered action requested: {effective_name}. Rejecting by default (fail-closed).")
             return AuthorizationResult(
                 allowed=False,
-                action_name=action_name,
+                action_name=effective_name,
                 level=AuthorityLevel.L3_PROTECTED,
-                reason=f"Action '{action_name}' is not registered in the authority matrix (fail-closed policy).",
+                reason=f"Action '{effective_name}' is not registered in the authority matrix (fail-closed policy).",
             )
+
+        # Check task-scoped consent for bounded multi-step operations
+        task_id = (context or {}).get("task_id")
+        if task_id and task_id in self._active_task_consents:
+            # L3 protected actions CANNOT bypass explicit user consent via task scope
+            if policy.required_level < AuthorityLevel.L3_PROTECTED and not policy.requires_explicit_consent:
+                task_consent = self._active_task_consents[task_id]
+                valid, msg = task_consent.validate_and_consume(effective_name, context)
+                if valid:
+                    return AuthorizationResult(
+                        allowed=True,
+                        action_name=effective_name,
+                        level=policy.required_level,
+                        reason=msg,
+                        user_consent_required=False,
+                    )
+                else:
+                    logger.warning(f"Task-scoped consent check failed for '{effective_name}': {msg}")
+                    return AuthorizationResult(
+                        allowed=False,
+                        action_name=effective_name,
+                        level=policy.required_level,
+                        reason=f"Task-scoped consent check failed: {msg}",
+                        user_consent_required=True,
+                    )
 
         # L0 and L1 are autonomous
         if policy.required_level in (AuthorityLevel.L0_OBSERVE, AuthorityLevel.L1_RECOMMEND):

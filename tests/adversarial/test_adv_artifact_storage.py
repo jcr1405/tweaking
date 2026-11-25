@@ -47,14 +47,14 @@ class TestAdvArtifactStorage(unittest.TestCase):
     def test_multibyte_utf8_threshold_boundary(self):
         """Verifies UTF-8 multibyte characters (e.g. 3-byte or 4-byte characters) correctly trigger offload based on byte length."""
         # 3-byte UTF-8 char: '€'
-        # 13,653 * 3 = 40,959 bytes
-        payload_sub = "€" * 13653
-        self.assertEqual(len(payload_sub.encode("utf-8")), 40959)
+        chars_sub = (ARTIFACT_THRESHOLD_BYTES - 1) // 3
+        payload_sub = "€" * chars_sub
+        self.assertLessEqual(len(payload_sub.encode("utf-8")), ARTIFACT_THRESHOLD_BYTES)
         self.assertFalse(self.store.should_offload(payload_sub))
 
-        # 13,654 * 3 = 40,962 bytes (> 40960)
-        payload_over = "€" * 13654
-        self.assertEqual(len(payload_over.encode("utf-8")), 40962)
+        chars_over = (ARTIFACT_THRESHOLD_BYTES // 3) + 1
+        payload_over = "€" * chars_over
+        self.assertGreater(len(payload_over.encode("utf-8")), ARTIFACT_THRESHOLD_BYTES)
         self.assertTrue(self.store.should_offload(payload_over))
 
     def test_chunked_byte_read_multibyte_safety(self):

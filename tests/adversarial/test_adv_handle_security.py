@@ -66,15 +66,19 @@ class TestAdvHandleSecurity(unittest.TestCase):
             "event_h = int(sys.argv[1])\n"
             "mutex_h = int(sys.argv[2])\n"
             "pipe_h = int(sys.argv[3])\n"
-            "flags = wintypes.DWORD()\n"
+            "# 1. Child attempts to signal parent event\n"
             "kernel32.SetLastError(0)\n"
-            "res_event = kernel32.GetHandleInformation(wintypes.HANDLE(event_h), ctypes.byref(flags))\n"
+            "res_event = kernel32.SetEvent(wintypes.HANDLE(event_h))\n"
             "err_event = kernel32.GetLastError()\n"
+            "# 2. Child attempts to release parent mutex\n"
             "kernel32.SetLastError(0)\n"
-            "res_mutex = kernel32.GetHandleInformation(wintypes.HANDLE(mutex_h), ctypes.byref(flags))\n"
+            "res_mutex = kernel32.ReleaseMutex(wintypes.HANDLE(mutex_h))\n"
             "err_mutex = kernel32.GetLastError()\n"
+            "# 3. Child attempts to write to parent dummy pipe\n"
+            "dummy_bytes = b'LEAK'\n"
+            "written = wintypes.DWORD()\n"
             "kernel32.SetLastError(0)\n"
-            "res_pipe = kernel32.GetHandleInformation(wintypes.HANDLE(pipe_h), ctypes.byref(flags))\n"
+            "res_pipe = kernel32.WriteFile(wintypes.HANDLE(pipe_h), dummy_bytes, len(dummy_bytes), ctypes.byref(written), None)\n"
             "err_pipe = kernel32.GetLastError()\n"
             "print(f'EVENT_RES={res_event},ERR={err_event}', flush=True)\n"
             "print(f'MUTEX_RES={res_mutex},ERR={err_mutex}', flush=True)\n"
@@ -89,14 +93,49 @@ class TestAdvHandleSecurity(unittest.TestCase):
                 job=job,
             )
 
+            # Check kernel object isolation using DuplicateHandle & CompareObjectHandles
+            DUPLICATE_SAME_ACCESS = 0x00000002
+            kernelbase = getattr(ctypes.windll, "kernelbase", kernel32)
+            for h_val, h_parent, desc in [
+                (event_val, h_event, "event"),
+                (mutex_val, h_mutex, "mutex"),
+                (dummy_pipe_val, h_dummy_read, "pipe"),
+            ]:
+                h_dup = wintypes.HANDLE()
+                dup_ok = kernel32.DuplicateHandle(
+                    proc.h_process,
+                    wintypes.HANDLE(h_val),
+                    kernel32.GetCurrentProcess(),
+                    ctypes.byref(h_dup),
+                    0,
+                    False,
+                    DUPLICATE_SAME_ACCESS,
+                )
+                if dup_ok:
+                    # If slot was reused by child CRT for an internal object, prove it is NOT the parent's object
+                    if hasattr(kernelbase, "CompareObjectHandles"):
+                        same = kernelbase.CompareObjectHandles(wintypes.HANDLE(h_parent), h_dup)
+                        self.assertFalse(bool(same), f"Child handle {desc} must NOT match parent kernel object")
+                    kernel32.CloseHandle(h_dup)
+                else:
+                    # Slot does not exist in child (standard case)
+                    self.assertEqual(kernel32.GetLastError(), 6, f"DuplicateHandle for {desc} must return ERROR_INVALID_HANDLE")
+
             line_ev = proc.stdout.readline().decode().strip()
             line_mu = proc.stdout.readline().decode().strip()
             line_pi = proc.stdout.readline().decode().strip()
 
-            # Win32 GetHandleInformation returns 0 with error 6 (ERROR_INVALID_HANDLE) when handle is not present in process
-            self.assertEqual(line_ev, "EVENT_RES=0,ERR=6", "Parent event handle must be INVALID_HANDLE in child")
-            self.assertEqual(line_mu, "MUTEX_RES=0,ERR=6", "Parent mutex handle must be INVALID_HANDLE in child")
-            self.assertEqual(line_pi, "PIPE_RES=0,ERR=6", "Parent dummy pipe handle must be INVALID_HANDLE in child")
+            # Verify in parent that child operations could not affect parent kernel objects:
+            WAIT_TIMEOUT = 258
+            self.assertEqual(
+                kernel32.WaitForSingleObject(h_event, 0),
+                WAIT_TIMEOUT,
+                "Parent event must remain unsignaled despite child attempt to signal it"
+            )
+
+            avail = wintypes.DWORD()
+            kernel32.PeekNamedPipe(h_dummy_read, None, 0, None, ctypes.byref(avail), None)
+            self.assertEqual(avail.value, 0, "Parent pipe must contain 0 leaked bytes")
 
             self.assertEqual(proc.wait(timeout_ms=5000), 0)
             proc.close()

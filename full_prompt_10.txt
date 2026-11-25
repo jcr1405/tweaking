@@ -1,0 +1,374 @@
+<USER_REQUEST>
+# PRESENCE — CORE RUNTIME INTEGRATION & INTERACTIVE SESSION ENABLEMENT
+## Objective
+Complete the integration between the existing Presence architecture and its actual Windows TUI session. The architecture already contains task planning, workflow execution, subagent supervision, desktop automation, local inference, filesystem MCP, shell MCP and cryptographic consent infrastructure. Several of these capabilities are implemented but are not instantiated, registered or accessible through the current interactive session.
+Your job is to connect these existing components correctly and make Presence's actual capabilities match its architectural design.
+This is an IMPLEMENTATION task, not another architecture proposal.
+Do not create another major architecture phase. Do not replace existing subsystems. Reuse existing implementations wherever possible.
+## CRITICAL ENGINEERING RULES
+1. Inspect the actual current source code before making changes. Treat previous audit reports as investigation evidence, not unquestionable truth.
+2. Preserve the existing architecture and established interfaces.
+3. Reuse existing ToolRegistry, PermissionBoundary, ProcessManager, AgentSessionFactory, LocalOperationsSupervisor, SubagentManager, WorkflowEngine, TaskPlanningService, TDEL, EventBus, ArtifactStore, SQLite persistence and LocalInferenceSemaphore.
+4. Do not introduce duplicate registries, task managers, workflow engines, permission systems, artifact stores, provider coordinators or inference semaphores.
+5. Do not expose raw MCP catalogues, unrestricted shell capabilities, raw filesystem tools or desktop execution tools directly to the cloud principal.
+6. The Cloud Principal should retain its high-level conversational and planning responsibilities. LocalOperationsSupervisor owns local operational execution.
+7. All local operational model calls must remain pinned to Ollama/Qwen without cloud fallback.
+8. Model-generated text must never authorize an operation, issue consent tokens or bypass PermissionBoundary.
+9. All consequential operations must fail closed when authorization is unavailable or ambiguous.
+10. Preserve existing SQLite data, user configuration, secrets and project files. Never use git reset, checkout, clean or restore to discard existing work.
+11. Do not silently modify existing untracked subsystems. Inspect Git status and preserve all existing changes.
+12. Do not weaken, delete or rewrite existing tests merely to make the implementation pass.
+13. Avoid live cloud API calls and unnecessary quota consumption during regression testing.
+14. Do not claim a capability is available just because its class or implementation exists.
+## PHASE 0 — ESTABLISH THE CURRENT BASELINE
+Before implementation, inspect:
+- `runtime/main.py`
+- `runtime/session.py`
+- `runtime/lifecycle.py`
+- `runtime/task_planning/`
+- `runtime/workflows/`
+- `runtime/local_operations/`
+- `runtime/subagents/`
+- `runtime/desktop/`
+- `runtime/tools/`
+- `runtime/mcp/`
+- `runtime/tui/`
+- `runtime/permissions.py`
+- `runtime/process_manager/`
+Establish:
+- Current session creation path.
+- Actual registered tools.
+- Session role and permission configuration.
+- Existing LocalOperationsSupervisor construction and dependencies.
+- Existing DesktopController construction and workflow adapter.
+- MCP server startup and connection lifecycle.
+- Existing consent-token lifecycle.
+- Workflow pause/resume implementation.
+- Existing TUI event rendering and input handling.
+- All currently passing relevant test suites.
+Record `git status --short` and preserve all pre-existing modifications.
+Produce a concise baseline inventory, then proceed with implementation. Do not stop after producing an architecture review.
+## PHASE 1 — FIX CONVERSATIONAL ROUTING (HIGHEST PRIORITY)
+### Current problem
+`ComplexityClassifier` relies heavily on keyword matching and starting-prefix checks.
+The current routing path in `AgentSession.execute_turn()` can classify conversational questions as LONG_RUNNING or COMPLEX and preempt the normal conversational model before it sees the user's message.
+For example, asking:
+"What are your capabilities? Explain whether you can inspect projects, run tests and operate Windows."
+can trigger TDEL because it contains words such as `inspect`, `run tests` and `desktop`.
+Even worse, the classifier does not understand explicit negative instructions such as:
+"This is a question, NOT a task. Do not invoke TDEL."
+### Required behaviour
+Separate conversational intent from operational intent.
+Implement a deterministic conversation-first routing policy that considers the complete user request rather than blindly scanning keywords.
+Recognize these as conversational:
+- Questions about Presence's capabilities.
+- Explanations of how Presence works.
+- Architectural discussions.
+- Requests for advice or recommendations.
+- Hypothetical scenarios.
+- Questions mentioning tools, shell commands, file edits or desktop operations without requesting their execution.
+- Questions containing operational keywords inside quotations, examples, code blocks or negative instructions.
+Recognize these as operational only when the user actually requests an action.
+Examples:
+- "What can you do with my files?" → CONVERSATION.
+- "Explain how you would debug this project." → CONVERSATION.
+- "Could you inspect my project and identify the failing tests?" → OPERATIONAL.
+- "Run the tests in this project and report failures." → OPERATIONAL.
+- "Create a plan for updating the project, but do not execute it." → PLAN_ONLY.
+- "Execute this approved plan." → OPERATIONAL.
+### Architecture requirements
+1. Conversational questions must reach the normal conversational provider path without initializing TDEL.
+2. Operational requests may enter the existing planning and execution path.
+3. Explicitly requested plan-only operations must not execute automatically.
+4. Ambiguous requests should default to conversation or ask for clarification rather than silently executing.
+5. Negation, hypothetical language, quoted instructions and examples must not be treated as execution authorization.
+6. Preserve explicit tool invocation and existing operational workflows.
+7. Do not add another LLM-based intent classifier that introduces unnecessary latency or an additional provider dependency.
+8. Use the existing classifier and routing boundary, improving them with a clear intent decision.
+9. Avoid breaking normal short commands such as "search the web for..." or "open this file..." when their intent is genuinely operational.
+10. Make the intent classification observable through structured logs, without logging sensitive prompt contents.
+### Required regression tests
+Test at least 25 representative prompts covering:
+- Capability questions.
+- Architecture explanations.
+- System design discussions.
+- Operational requests.
+- Plan-only requests.
+- Explicit execution requests.
+- Negative instructions.
+- Hypothetical examples.
+- Quoted commands.
+- Long prompts containing words such as `run tests`, `inspect`, `shell`, `desktop` and `delete` without requesting execution.
+The original failed capability-audit prompt must be a regression test.
+Assert that conversational prompts do not emit `PLAN_CREATED`, do not invoke TaskPlanningService and do not create DAGs.
+## PHASE 2 — CONNECT LocalOperationsSupervisor TO THE LIVE SESSION
+### Current problem
+The previous audit found that LocalOperationsSupervisor is implemented but not instantiated or connected through the runtime session factory.
+Consequently, `presence.delegate_local_work` is absent from the actual TUI session.
+### Required integration
+Connect the existing supervisor through the established runtime lifecycle and session factory.
+Reuse:
+- Existing AgentSessionFactory.
+- Existing AgentExecutor.
+- Existing LocalOperationsSupervisor.
+- Existing SubagentManager.
+- Existing LocalInferenceSemaphore.
+- Existing TaskRegistry and ActiveTaskRegistry.
+- Existing TaskDelegationContract.
+- Existing CloudReturnPacket and PacketValidator.
+- Existing BudgetManager.
+Do not create duplicate instances of infrastructure that is already process-wide.
+### Invocation boundary
+The intended architecture is:
+Cloud Principal → `presence.delegate_local_work` → LocalOperationsSupervisor → Local Tools / Subagents → CloudReturnPacket → Cloud Principal.
+The cloud principal should receive the single intended delegation capability rather than the raw operational tool catalogue.
+LocalOperationsSupervisor must own its local ReAct/tool loop.
+Local subagents must not gain cloud-provider fallback.
+### Security requirements
+- Verify the actual parent session identity.
+- Verify that the caller is authorized to delegate.
+- Enforce task and conversation scope.
+- Enforce budgets, timeout, cancellation and nesting limits.
+- Pin all operational inference to Ollama/Qwen.
+- Preserve the shared LocalInferenceSemaphore.
+- Do not allow model-generated task contracts to grant additional permissions.
+- Validate all returned artifact references and packet fields.
+- Keep operational execution and evidence processing local.
+- Preserve existing escalation boundaries.
+### Required tests
+1. Current cloud-principal TUI session exposes `presence.delegate_local_work`.
+2. Local supervisor actually executes a bounded harmless task.
+3. Local execution never invokes Gemini or FreeLLMAPI.
+4. Invalid caller identities are rejected.
+5. Local child sessions cannot invoke cloud delegation.
+6. Cancellation cleans up active tasks and subagents.
+7. Budget exhaustion is handled correctly.
+8. CloudReturnPacket validation rejects tampered or out-of-scope evidence.
+9. No duplicate tool invocation occurs during failover.
+## PHASE 3 — CONNECT DESKTOP AUTOMATION THROUGH THE LOCAL SUPERVISOR
+### Current problem
+The desktop subsystem is implemented, but the previous audit found that its five tools are not exposed in the interactive session because `include_desktop_tools=False` is retained and the runtime lifecycle does not provide the required DesktopController.
+Existing capabilities include:
+- Windows UI Automation.
+- Window enumeration.
+- Observation and capture.
+- Windows OCR.
+- OpenCV visual candidate detection.
+- Qwen multimodal grounding.
+- Mouse and keyboard input.
+- Action verification.
+### Required integration
+Instantiate or acquire the existing DesktopController through the correct runtime lifecycle.
+Reuse the existing DesktopWorkflowAdapter and desktop permission policies.
+Make desktop capabilities available to LocalOperationsSupervisor through its existing operational tool boundary.
+IMPORTANT: Do not expose unrestricted `desktop.execute_actions`, raw screenshots or the complete desktop tool catalogue directly to the Cloud Principal.
+Preserve the intended architecture in which local desktop observation and interaction are performed locally.
+Support:
+- Listing visible windows.
+- Inspecting the active window.
+- Read-only observation.
+- OCR and visual perception.
+- Identifying UI targets.
+- Executing specifically authorized actions.
+- Verifying action outcomes.
+### Desktop safety requirements
+- Respect protected-process restrictions.
+- Respect foreground-window and target-window identity.
+- Verify screenshot freshness before coordinate-based input.
+- Preserve DPI and multi-monitor transformations.
+- Validate action targets before execution.
+- Prevent stale-target clicks.
+- Never allow the model to bypass the desktop PermissionBoundary.
+- Require appropriate consent for consequential or state-changing operations.
+- Never silently turn a failed observation into an execution action.
+- Do not send raw desktop screenshots to cloud providers.
+### Required tests
+1. Current TUI runtime can access the local desktop capability through the authorized delegation path.
+2. A harmless read-only window inspection succeeds.
+3. OCR and visual grounding remain locally executed.
+4. A stale screenshot cannot authorize a click.
+5. A protected application cannot be manipulated.
+6. Unauthorized desktop input is rejected.
+7. A permitted harmless test action can be executed and independently verified.
+8. The Cloud Principal cannot directly call unrestricted desktop execution tools.
+## PHASE 4 — IMPLEMENT A REAL USER-FACING APPROVAL FLOW
+### Current problem
+The backend has consent-token issuance and verification infrastructure, but the TUI has no actual approval component.
+Consequently, protected operations can reach NEEDS_CONSENT or PERMISSION_DENIED without a proper way for the user to authorize them.
+### Required integration
+Connect the existing consent infrastructure to actual TUI interactions.
+Do not create a second authorization system.
+When an operation requires approval:
+1. The operation must pause before the protected side effect.
+2. The workflow must enter the existing WAITING_FOR_APPROVAL or AWAITING_APPROVAL state.
+3. The TUI must display a clear approval request.
+4. The user must be able to approve or reject through actual TUI keyboard/input interaction.
+5. Approval must resume only the specifically authorized operation.
+6. Rejection must cancel that operation safely.
+### Approval display
+Show:
+- Requested operation.
+- Target application, file, process or resource.
+- Relevant parameters.
+- Why approval is needed.
+- Expected side effects.
+- Whether the operation is reversible.
+- Expiry time.
+- Exact operation scope.
+Provide clear Approve and Reject controls compatible with the current TUI rendering architecture.
+### Cryptographic consent requirements
+Reuse existing `issue_consent_token()` and `verify_consent_token()` implementations.
+Tokens must be bound to:
+- Exact user identity.
+- Conversation identity.
+- Task/workflow identity.
+- Exact action and arguments.
+- Expiry.
+- Single-use nonce or equivalent anti-replay mechanism.
+A token for one operation must never authorize another operation.
+The model must never issue its own approval token.
+Timeout, rejection, invalid signatures, replay and cross-conversation attempts must fail closed.
+Never treat an LLM-generated message such as "the user approves" as authorization.
+The approval must originate from the real user interaction path.
+### Required tests
+- TUI renders an actual approval request.
+- Workflow pauses before the side effect.
+- Explicit user approval resumes the correct operation.
+- Rejection prevents the side effect.
+- Expired consent is rejected.
+- Replayed consent is rejected.
+- Tampered parameters invalidate consent.
+- Cross-conversation consent is rejected.
+- Model-generated approval statements have no effect.
+- Application restart does not turn a pending approval into automatic approval.
+## PHASE 5 — CONNECT THE EXISTING FILESYSTEM AND SHELL MCP SERVERS
+### Current problem
+Filesystem and shell MCP implementations exist and are configured, but the previous audit found that their tools are not attached to the live interactive session.
+### Required integration
+Connect the existing MCP lifecycle to the local operational runtime.
+Reuse existing MCP server configuration, client management, connection handling and tool adaptation.
+Do not build another MCP client or another tool registry.
+The local supervisor should be able to access approved MCP tools through the existing ToolRegistry integration.
+Do not expose the raw MCP catalogue to the Cloud Principal.
+### Filesystem
+Support the existing approved operations:
+- Directory listing.
+- File metadata.
+- File reading.
+- Filename and content search.
+- File creation.
+- File editing.
+- File moving or renaming.
+- File deletion where authorized.
+Preserve workspace scope, path validation, symlink protections and permission tiers.
+Directory deletion and other explicitly restricted operations must remain restricted.
+### Shell and process management
+Support the existing shell MCP integration through ProcessManager.
+Preserve Windows Job Object containment.
+Apply command validation, working-directory restrictions and execution budgets.
+Do not turn shell execution into unrestricted arbitrary command access.
+Use explicit authorization for protected or destructive actions.
+Only terminate processes that the actual process authority permits.
+### Required tests
+- MCP servers start and connect reliably.
+- Tools are discoverable inside the local operational supervisor.
+- File reads work within authorized workspace scope.
+- File writes respect permission boundaries.
+- Path traversal and symlink escapes are rejected.
+- Shell commands run inside the established process-containment infrastructure.
+- Timeout and cancellation work.
+- Unauthorized destructive commands fail closed.
+- MCP disconnection is reported correctly without corrupting session state.
+## PHASE 6 — TUI CAPABILITY DISCOVERY
+Once integration is complete, ensure Presence can accurately answer questions about its own capabilities without creating a workflow.
+Add or reuse a deterministic runtime capability snapshot assembled from:
+- Actual ToolRegistry contents.
+- Session role.
+- Connected MCP servers.
+- DesktopController availability.
+- LocalOperationsSupervisor availability.
+- Approval-interface availability.
+- Provider configuration.
+- PermissionBoundary capabilities.
+- Runtime health.
+The conversational model should receive a compact trusted capability summary rather than being asked to guess what is implemented.
+Distinguish:
+- IMPLEMENTED: exists in the codebase.
+- REGISTERED: attached to the current session or authorized local subsystem.
+- AVAILABLE NOW: initialized and callable with current permissions.
+- LIVE-VERIFIED: successfully exercised in this runtime.
+Do not advertise unavailable features.
+Do not advertise unrestricted permissions when only scoped access exists.
+This capability snapshot should be generated by trusted runtime code, not invented by the model.
+Add regression tests proving that questions such as "What can you do?", "Can you inspect my desktop?" and "Can you edit my files?" remain ordinary conversational turns and do not invoke TDEL.
+## PHASE 7 — REGRESSION AND END-TO-END ACCEPTANCE
+Execute the relevant existing regression suites and all newly added tests.
+At minimum, validate:
+- Conversation routing.
+- Task classification.
+- TDEL.
+- Workflow execution.
+- LocalOperationsSupervisor.
+- Subagent lifecycle.
+- Shared LocalInferenceSemaphore.
+- ToolRegistry and PermissionBoundary.
+- Desktop observation and action policies.
+- Approval token lifecycle.
+- TUI approval interaction.
+- MCP connection and execution.
+- ProcessManager isolation.
+- CloudReturnPacket validation.
+- Provider routing and failover.
+Run selected live-local tests using Ollama where appropriate. Do not consume live cloud quota unnecessarily.
+Perform harmless end-to-end TUI smoke tests:
+A. Ask Presence what it can do. It answers without a DAG.
+B. Ask Presence to inspect a harmless local directory. It delegates through LocalOperationsSupervisor.
+C. Ask Presence to inspect an active window. Desktop observation is performed locally.
+D. Request a protected operation. The workflow pauses for actual user approval.
+E. Reject an approval. The protected side effect never occurs.
+F. Approve an isolated test-fixture operation. It executes once and is verified.
+G. Ask an ordinary architectural question mentioning shell commands, tests and file editing. No operational tools are invoked.
+H. Disconnect an MCP server. Presence reports the limitation without crashing.
+## PHASE 8 — FINAL REPORT
+Deliver:
+1. Exact files changed.
+2. Existing components reused.
+3. New components added, if absolutely necessary, with justification.
+4. Conversational routing behaviour before and after.
+5. Actual current TUI registry.
+6. LocalOperationsSupervisor invocation evidence.
+7. Desktop capability integration evidence.
+8. MCP connection evidence.
+9. Actual user-facing approval demonstration.
+10. Security boundary verification.
+11. Exact test commands and results.
+12. Tests discovered versus tests executed.
+13. Tests passed, failed and skipped.
+14. Any capabilities that remain unavailable.
+15. Any risks or incomplete integrations.
+16. Rollback instructions.
+Finish with a capability matrix: IMPLEMENTED | REGISTERED | AVAILABLE NOW | LIVE-VERIFIED.
+Do not mark a capability live-verified solely because a unit test or mocked adapter passed. Distinguish mocked, integration and actual runtime tests.
+## ACCEPTANCE CRITERIA
+The integration is accepted only when:
+- Ordinary conversation never gets automatically converted into a task DAG.
+- Explicit operational requests can still use TDEL.
+- LocalOperationsSupervisor is actually connected to the live TUI session.
+- Cloud delegation is limited to its intended internal capability.
+- Desktop interaction is accessible through the local operational boundary.
+- Filesystem and shell MCP capabilities are connected through the local operational boundary.
+- Real approval requests appear in the TUI and can be approved or rejected by the user.
+- Protected operations cannot execute without valid, action-bound consent.
+- No raw screenshots, unrestricted shell catalogue or unrestricted MCP catalogue is exposed to the cloud principal.
+- Existing architecture and permission boundaries remain intact.
+- Relevant regression suites pass.
+## EXECUTION INSTRUCTIONS
+Implement in the order specified: conversational routing first, LocalOperationsSupervisor second, desktop integration third, approval interface fourth, MCP integration fifth, then capability discovery and final regression.
+After each integration step, run its targeted tests before proceeding.
+If an existing security invariant cannot be preserved, stop that specific integration and report the blocker instead of weakening the boundary.
+Do not create a new architecture phase, redesign the entire application or start unrelated improvements.
+Do not merely provide a plan. Make the changes, test them, and deliver the final evidence-based report.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-21T17:34:17+05:30.
+</ADDITIONAL_METADATA>

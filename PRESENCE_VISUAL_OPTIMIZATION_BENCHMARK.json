@@ -1,0 +1,86 @@
+{
+  "metadata": {
+    "subsystem": "Presence Tier 2 Fast Visual Grounding & Routing",
+    "phase": "2E.2 Optimized",
+    "environment": "Windows 11 Pro, Python 3.12.10, Native WinRT OCR + OpenCV",
+    "benchmark_date": "2026-11-21",
+    "samples_per_component": 20
+  },
+  "tier1_uia_fast_path_ms": {
+    "median": 35.46,
+    "p95": 43.28,
+    "gpu_utilization_pct": 0.0,
+    "cloud_leakage_bytes": 0
+  },
+  "tier2_fast_visual_grounding": {
+    "windows_media_ocr_ms": {
+      "median": 23.42,
+      "p95": 27.4,
+      "min": 21.51,
+      "max": 28.6,
+      "samples": 20
+    },
+    "lightweight_ui_detector_ms": {
+      "median": 9.84,
+      "p95": 11.44,
+      "min": 8.32,
+      "max": 13.29,
+      "samples": 20
+    },
+    "fusion_and_grounding_ms": {
+      "median": 37.58,
+      "p95": 41.29,
+      "min": 34.09,
+      "max": 41.62,
+      "samples": 20
+    },
+    "roi_crop_extraction_ms": {
+      "median": 3.05,
+      "p95": 4.07,
+      "min": 2.14,
+      "max": 4.47,
+      "samples": 20
+    },
+    "gpu_utilization_pct": 0.0,
+    "cloud_leakage_bytes": 0
+  },
+  "tier3_qwen_multimodal_vision_fallback": {
+    "full_frame_median_ms": 42619.48,
+    "targeted_crop_estimated_ms": 10654.87,
+    "frequency_pct": 2.5,
+    "notes": "Invoked solely for visual ambiguity or complex layout reasoning"
+  },
+  "end_to_end_latency_comparison": {
+    "baseline_tier3_loop_ms": 42789.58,
+    "optimized_tier2_loop_ms": 207.68,
+    "speedup_factor_perception": 1134.1,
+    "speedup_factor_end_to_end": 206.0
+  },
+  "acceptance_gates_verified": [
+    "V2-01",
+    "V2-02",
+    "V2-03",
+    "V2-04",
+    "V2-05",
+    "V2-06",
+    "V2-07",
+    "V2-08",
+    "V2-09",
+    "V2-10",
+    "V2-11",
+    "V2-12",
+    "V2-13",
+    "V2-14",
+    "V2-15",
+    "V2-16",
+    "V2-17",
+    "V2-18",
+    "V2-19",
+    "V2-20",
+    "V2-21",
+    "V2-22",
+    "V2-23",
+    "V2-24",
+    "V2-25"
+  ]
+}
